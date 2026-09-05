@@ -1,4 +1,14 @@
-name: Code Review
+name: Code Review (Normal Chat Orchestrated)
+
+# The GitHub workflow is the bounded Goose review worker. The primary
+# orchestrator is an ordinary ChatGPT chat running GPT-5.6 at High effort.
+# Goose is independently capped at High effort so it cannot escalate to Max/xhigh.
+env:
+  GOOSE_REVIEW_ORCHESTRATOR: normal-chat
+  GOOSE_REVIEW_ORCHESTRATOR_MODEL: gpt-5.6
+  GOOSE_REVIEW_ORCHESTRATOR_REASONING_MODE: standard
+  GOOSE_REVIEW_ORCHESTRATOR_REASONING_EFFORT: high
+  GOOSE_THINKING_EFFORT: high
 
 on:
   workflow_dispatch:
@@ -16,11 +26,9 @@ on:
         required: false
         default: 'Review the changes for correctness'
         type: string
-  # pull_request_target:
-  #   types: [opened, synchronize, reopened]
 
 concurrency:
-  group: code-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  group: code-review-${{ github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
@@ -31,6 +39,20 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Record reviewer orchestration contract
+        run: |
+          test "$GOOSE_REVIEW_ORCHESTRATOR" = "normal-chat"
+          test "$GOOSE_REVIEW_ORCHESTRATOR_MODEL" = "gpt-5.6"
+          test "$GOOSE_REVIEW_ORCHESTRATOR_REASONING_MODE" = "standard"
+          test "$GOOSE_REVIEW_ORCHESTRATOR_REASONING_EFFORT" = "high"
+          test "$GOOSE_THINKING_EFFORT" = "high"
+          printf '%s\n' \
+            "orchestrator=$GOOSE_REVIEW_ORCHESTRATOR" \
+            "orchestrator_model=$GOOSE_REVIEW_ORCHESTRATOR_MODEL" \
+            "orchestrator_reasoning_mode=$GOOSE_REVIEW_ORCHESTRATOR_REASONING_MODE" \
+            "orchestrator_reasoning_effort=$GOOSE_REVIEW_ORCHESTRATOR_REASONING_EFFORT" \
+            "goose_thinking_effort=$GOOSE_THINKING_EFFORT"
+
       - name: Mint OIDC token
         id: oidc
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -46,7 +68,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_NUMBER=${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          PR_NUMBER=${{ github.event.inputs.pr_number }}
           mkdir -p /tmp/code-review
 
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq '.title' > /tmp/code-review/title.txt
@@ -84,7 +106,7 @@ jobs:
 
     steps:
       - name: Checkout base branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
         run: |
@@ -97,10 +119,11 @@ jobs:
           name: code-review-inputs
           path: /tmp/code-review
 
-      - name: Install custom provider and run goose review
+      - name: Run Goose review at High effort
         env:
           GOOSE_PROVIDER: anthropic-oidc-proxy
           GOOSE_MODEL: ${{ vars.GOOSE_CODE_REVIEW_MODEL || 'claude-opus-4-6' }}
+          GOOSE_THINKING_EFFORT: high
           OIDC_PROXY_URL: ${{ github.event.inputs.oidc_proxy_url || vars.OIDC_PROXY_URL }}
           REVIEW_INSTRUCTIONS: ${{ github.event.inputs.review_instructions || 'Review the changes for correctness' }}
         run: |
@@ -151,7 +174,7 @@ jobs:
       - name: Submit review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
         run: |
           CONCLUSION="/tmp/output/conclusion.json"
           COMMENTS="/tmp/output/comments.json"

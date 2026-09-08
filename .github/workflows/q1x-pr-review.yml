@@ -59,13 +59,14 @@ jobs:
   assurance-evidence:
     needs: exact-head-contract
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
       checks: read
       statuses: read
     steps:
-      - name: Collect exact-head CI and independent-assurance evidence
+      - name: Verify PR head and create Ordinary-Chat primary-review request packet
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -75,15 +76,6 @@ jobs:
           mkdir -p /tmp/q1x-review
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > /tmp/q1x-review/pr.json
           test "$(jq -r .head.sha /tmp/q1x-review/pr.json)" = "$EXPECTED_HEAD"
-          gh api -H 'Accept: application/vnd.github+json' "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" > /tmp/q1x-review/check-runs.json
-          gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" > /tmp/q1x-review/status.json
-
-      - name: Create Ordinary-Chat primary-review request packet
-        env:
-          PR_NUMBER: ${{ inputs.pr_number }}
-          EXPECTED_HEAD: ${{ inputs.head_sha }}
-        run: |
-          set -euo pipefail
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
             --argjson pr "$PR_NUMBER" \
@@ -99,35 +91,107 @@ jobs:
               instructions: "Perform the primary semantic code review against this exact head. Do not use Work Chat, Codex Cloud automatic review, or Anthropic/Claude."
             }' > /tmp/q1x-review/ordinary-chat-review-request.json
 
-      - name: Fail on completed adverse assurance checks
+      - name: Wait for configured independent assurance and fail closed on adverse evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
         run: |
-          set -euo pipefail
-          adverse_checks="$(jq '[.check_runs[] | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | select(.name | test("circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security"; "i"))] | length' /tmp/q1x-review/check-runs.json)"
-          adverse_statuses="$(jq '[.statuses[]? | select(.state == "failure" or .state == "error") | select(.context | test("circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security"; "i"))] | length' /tmp/q1x-review/status.json)"
-          if [ "$adverse_checks" -gt 0 ] || [ "$adverse_statuses" -gt 0 ]; then
-            echo 'One or more configured independent assurance controls are adverse.'
-            jq '[.check_runs[] | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | {name, conclusion, html_url}]' /tmp/q1x-review/check-runs.json
-            jq '[.statuses[]? | select(.state == "failure" or .state == "error") | {context, state, target_url}]' /tmp/q1x-review/status.json
-            exit 1
-          fi
-          echo 'No completed adverse CircleCI/security/quality assurance check is present on this exact head.'
+          set -u
+          regex='circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security'
+          result_code=0
+          state='unknown'
+          relevant=0
+          pending=0
+          adverse=0
 
-      - name: Record assurance summary
+          for attempt in $(seq 1 46); do
+            gh api -H 'Accept: application/vnd.github+json' \
+              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
+              > /tmp/q1x-review/check-runs.json
+            gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" \
+              > /tmp/q1x-review/status.json
+
+            relevant_checks="$(jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i"))] | length' /tmp/q1x-review/check-runs.json)"
+            relevant_statuses="$(jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i"))] | length' /tmp/q1x-review/status.json)"
+            pending_checks="$(jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i")) | select(.status != "completed")] | length' /tmp/q1x-review/check-runs.json)"
+            pending_statuses="$(jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i")) | select(.state == "pending")] | length' /tmp/q1x-review/status.json)"
+            adverse_checks="$(jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i")) | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "stale")] | length' /tmp/q1x-review/check-runs.json)"
+            adverse_statuses="$(jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i")) | select(.state == "failure" or .state == "error")] | length' /tmp/q1x-review/status.json)"
+
+            relevant=$((relevant_checks + relevant_statuses))
+            pending=$((pending_checks + pending_statuses))
+            adverse=$((adverse_checks + adverse_statuses))
+
+            if [ "$adverse" -gt 0 ]; then
+              state='adverse'
+              result_code=1
+              break
+            fi
+
+            if [ "$relevant" -eq 0 ]; then
+              if [ "$attempt" -lt 3 ]; then
+                sleep 15
+                continue
+              fi
+              state='no-configured-independent-assurance'
+              break
+            fi
+
+            if [ "$pending" -eq 0 ]; then
+              state='completed-clean'
+              break
+            fi
+
+            if [ "$attempt" -eq 46 ]; then
+              state='timeout-pending'
+              result_code=1
+              break
+            fi
+
+            sleep 20
+          done
+
+          jq -n \
+            --arg state "$state" \
+            --argjson relevant "$relevant" \
+            --argjson pending "$pending" \
+            --argjson adverse "$adverse" \
+            '{schema:"q1x.independent-assurance-result.v1", state:$state, relevantControls:$relevant, pendingControls:$pending, adverseControls:$adverse}' \
+            > /tmp/q1x-review/assurance-result.json
+
+          if [ "$result_code" -ne 0 ]; then
+            echo "Independent assurance failed closed: $state"
+            jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i")) | {name, status, conclusion, app: (.app.slug // null), details_url}]' /tmp/q1x-review/check-runs.json || true
+            jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i")) | {context, state, target_url}]' /tmp/q1x-review/status.json || true
+            exit "$result_code"
+          fi
+
+          echo "Independent assurance state: $state"
+
+      - name: Record exact-head assurance summary
+        if: always()
         env:
           EXPECTED_HEAD: ${{ inputs.head_sha }}
         run: |
+          set -euo pipefail
+          test -f /tmp/q1x-review/check-runs.json || echo '{"check_runs":[]}' > /tmp/q1x-review/check-runs.json
+          test -f /tmp/q1x-review/status.json || echo '{"statuses":[]}' > /tmp/q1x-review/status.json
+          test -f /tmp/q1x-review/assurance-result.json || echo '{"schema":"q1x.independent-assurance-result.v1","state":"collection-error","relevantControls":0,"pendingControls":0,"adverseControls":0}' > /tmp/q1x-review/assurance-result.json
           jq -n \
             --arg head "$EXPECTED_HEAD" \
             --slurpfile checks /tmp/q1x-review/check-runs.json \
             --slurpfile status /tmp/q1x-review/status.json \
+            --slurpfile result /tmp/q1x-review/assurance-result.json \
             '{
               schema: "q1x.independent-assurance-evidence.v1",
               exactHead: $head,
+              result: $result[0],
               checks: [$checks[0].check_runs[] | {name, status, conclusion, app: (.app.slug // null), details_url}],
               statuses: [$status[0].statuses[]? | {context, state, target_url}]
             }' > /tmp/q1x-review/assurance-summary.json
 
       - name: Upload exact-head review packet and assurance evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: q1x-review-evidence-${{ inputs.pr_number }}-${{ inputs.head_sha }}
@@ -141,5 +205,5 @@ jobs:
       - name: Preserve the real Ordinary-Chat boundary
         run: |
           echo 'The installed Q1X PR Reviewer — Ordinary Chat app is the approved primary semantic-review surface.'
-          echo 'GitHub Actions prepares the exact-head request and assurance evidence automatically.'
+          echo 'GitHub Actions prepares the exact-head request and waits for configured independent assurance automatically.'
           echo 'This workflow does not substitute Codex, Work Chat, Anthropic, or an API-billed model for Ordinary Chat.'

@@ -1,0 +1,12 @@
+# Template only. Do not enable this file in Goose itself.
+# Active Quoralinex repositories receive an equivalent .github/workflows/q1x-goose-review.yml.
+name: Q1X Goose Review Caller Template
+
+on:
+  workflow_dispatch:
+
+jobs:
+  documentation-only:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Template only; repository callers use pull_request.'

@@ -38,7 +38,7 @@ jobs:
     steps:
       - name: Verify exact-head review contract
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_HEAD: ${{ inputs.head_sha }}
         run: |
@@ -67,7 +67,7 @@ jobs:
     steps:
       - name: Collect exact-head CI and independent-assurance evidence
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_HEAD: ${{ inputs.head_sha }}
         run: |

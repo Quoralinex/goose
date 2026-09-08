@@ -17,5 +17,4 @@ jobs:
     with:
       pr_number: ${{ github.event.pull_request.number }}
       head_sha: ${{ github.event.pull_request.head.sha }}
-      run_semantic_review: false
     secrets: inherit

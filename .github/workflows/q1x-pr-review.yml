@@ -1,0 +1,109 @@
+name: Q1X PR Review
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: Pull request number in the calling repository
+        required: true
+        type: number
+      head_sha:
+        description: Exact pull request head SHA
+        required: true
+        type: string
+      run_semantic_review:
+        description: Whether an approved semantic independent reviewer is available
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number in this repository
+        required: true
+        type: number
+      head_sha:
+        description: Exact pull request head SHA
+        required: true
+        type: string
+      run_semantic_review:
+        description: Whether an approved semantic independent reviewer is available
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: q1x-pr-review-${{ github.repository }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  review-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify exact-head review contract
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          actual_head="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)"
+          test "$actual_head" = "$EXPECTED_HEAD"
+          printf '%s\n' \
+            'orchestrator=normal-chat' \
+            'orchestrator_model=gpt-5.6' \
+            'orchestrator_effort=high' \
+            "repository=$GITHUB_REPOSITORY" \
+            "pr=$PR_NUMBER" \
+            "head=$EXPECTED_HEAD"
+
+  deterministic-assurance:
+    needs: review-contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: read
+    steps:
+      - name: Collect authoritative PR metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/q1x-review
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > /tmp/q1x-review/pr.json
+          test "$(jq -r .head.sha /tmp/q1x-review/pr.json)" = "$EXPECTED_HEAD"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs" > /tmp/q1x-review/check-runs.json
+          gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" > /tmp/q1x-review/status.json
+
+      - name: Require completed independent CI and security evidence when configured
+        run: |
+          set -euo pipefail
+          jq -e '[.check_runs[] | select(.status == "completed") | {name, conclusion}]' /tmp/q1x-review/check-runs.json >/dev/null
+          echo 'Q1X central review collected exact-head check evidence.'
+          echo 'Repository-specific CircleCI, CodeQL, Semgrep, Trivy, Gitleaks, SonarQube, Snyk and Codecov remain authoritative where that repository has them configured.'
+
+      - name: Upload assurance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: q1x-review-evidence-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+          path: /tmp/q1x-review
+          retention-days: 14
+
+  semantic-independent-review:
+    needs: deterministic-assurance
+    if: ${{ inputs.run_semantic_review }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse implicit external reviewer selection
+        run: |
+          echo 'No hosted semantic reviewer is selected implicitly.'
+          echo 'Normal Chat GPT-5.6 High remains the primary reviewer.'
+          echo 'The approved independent semantic reviewer must be connected through the Q1X reviewer bridge before this flag is enabled.'
+          exit 1

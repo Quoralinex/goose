@@ -56,28 +56,6 @@ jobs:
             "pr=$PR_NUMBER" \
             "head=$EXPECTED_HEAD"
 
-      - name: Create Ordinary-Chat review request packet
-        env:
-          PR_NUMBER: ${{ inputs.pr_number }}
-          EXPECTED_HEAD: ${{ inputs.head_sha }}
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/q1x-review
-          jq -n \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --argjson pr "$PR_NUMBER" \
-            --arg head "$EXPECTED_HEAD" \
-            '{
-              schema: "q1x.ordinary-chat-primary-review-request.v1",
-              callingSurface: "ordinary-chat",
-              reviewerModel: "GPT-5.6",
-              reviewerEffort: "High",
-              repository: $repository,
-              pullRequestNumber: $pr,
-              exactHead: $head,
-              instructions: "Perform the primary semantic code review against this exact head. Do not use Work Chat, Codex Cloud automatic review, or Anthropic/Claude."
-            }' > /tmp/q1x-review/ordinary-chat-review-request.json
-
   assurance-evidence:
     needs: exact-head-contract
     runs-on: ubuntu-latest
@@ -99,6 +77,27 @@ jobs:
           test "$(jq -r .head.sha /tmp/q1x-review/pr.json)" = "$EXPECTED_HEAD"
           gh api -H 'Accept: application/vnd.github+json' "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" > /tmp/q1x-review/check-runs.json
           gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" > /tmp/q1x-review/status.json
+
+      - name: Create Ordinary-Chat primary-review request packet
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson pr "$PR_NUMBER" \
+            --arg head "$EXPECTED_HEAD" \
+            '{
+              schema: "q1x.ordinary-chat-primary-review-request.v1",
+              callingSurface: "ordinary-chat",
+              reviewerModel: "GPT-5.6",
+              reviewerEffort: "High",
+              repository: $repository,
+              pullRequestNumber: $pr,
+              exactHead: $head,
+              instructions: "Perform the primary semantic code review against this exact head. Do not use Work Chat, Codex Cloud automatic review, or Anthropic/Claude."
+            }' > /tmp/q1x-review/ordinary-chat-review-request.json
 
       - name: Fail on completed adverse assurance checks
         run: |

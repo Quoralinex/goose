@@ -11,11 +11,6 @@ on:
         description: Exact pull request head SHA
         required: true
         type: string
-      run_semantic_review:
-        description: Whether an approved semantic independent reviewer is available
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
     inputs:
       pr_number:
@@ -26,22 +21,19 @@ on:
         description: Exact pull request head SHA
         required: true
         type: string
-      run_semantic_review:
-        description: Whether an approved semantic independent reviewer is available
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
   pull-requests: read
+  checks: read
+  statuses: read
 
 concurrency:
   group: q1x-pr-review-${{ github.repository }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}
   cancel-in-progress: true
 
 jobs:
-  review-contract:
+  exact-head-contract:
     runs-on: ubuntu-latest
     steps:
       - name: Verify exact-head review contract
@@ -54,22 +46,48 @@ jobs:
           actual_head="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)"
           test "$actual_head" = "$EXPECTED_HEAD"
           printf '%s\n' \
-            'orchestrator=normal-chat' \
-            'orchestrator_model=gpt-5.6' \
-            'orchestrator_effort=high' \
+            'primary_review_surface=ordinary-chat' \
+            'primary_review_model=gpt-5.6' \
+            'primary_review_effort=high' \
+            'work_chat_dependency=false' \
+            'codex_cloud_reviewer_dependency=false' \
+            'anthropic_dependency=false' \
             "repository=$GITHUB_REPOSITORY" \
             "pr=$PR_NUMBER" \
             "head=$EXPECTED_HEAD"
 
-  deterministic-assurance:
-    needs: review-contract
+      - name: Create Ordinary-Chat review request packet
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/q1x-review
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson pr "$PR_NUMBER" \
+            --arg head "$EXPECTED_HEAD" \
+            '{
+              schema: "q1x.ordinary-chat-primary-review-request.v1",
+              callingSurface: "ordinary-chat",
+              reviewerModel: "GPT-5.6",
+              reviewerEffort: "High",
+              repository: $repository,
+              pullRequestNumber: $pr,
+              exactHead: $head,
+              instructions: "Perform the primary semantic code review against this exact head. Do not use Work Chat, Codex Cloud automatic review, or Anthropic/Claude."
+            }' > /tmp/q1x-review/ordinary-chat-review-request.json
+
+  assurance-evidence:
+    needs: exact-head-contract
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
-      security-events: read
+      checks: read
+      statuses: read
     steps:
-      - name: Collect authoritative PR metadata
+      - name: Collect exact-head CI and independent-assurance evidence
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -79,31 +97,50 @@ jobs:
           mkdir -p /tmp/q1x-review
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > /tmp/q1x-review/pr.json
           test "$(jq -r .head.sha /tmp/q1x-review/pr.json)" = "$EXPECTED_HEAD"
-          gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs" > /tmp/q1x-review/check-runs.json
+          gh api -H 'Accept: application/vnd.github+json' "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" > /tmp/q1x-review/check-runs.json
           gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" > /tmp/q1x-review/status.json
 
-      - name: Require completed independent CI and security evidence when configured
+      - name: Fail on completed adverse assurance checks
         run: |
           set -euo pipefail
-          jq -e '[.check_runs[] | select(.status == "completed") | {name, conclusion}]' /tmp/q1x-review/check-runs.json >/dev/null
-          echo 'Q1X central review collected exact-head check evidence.'
-          echo 'Repository-specific CircleCI, CodeQL, Semgrep, Trivy, Gitleaks, SonarQube, Snyk and Codecov remain authoritative where that repository has them configured.'
+          adverse_checks="$(jq '[.check_runs[] | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | select(.name | test("circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security"; "i"))] | length' /tmp/q1x-review/check-runs.json)"
+          adverse_statuses="$(jq '[.statuses[]? | select(.state == "failure" or .state == "error") | select(.context | test("circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security"; "i"))] | length' /tmp/q1x-review/status.json)"
+          if [ "$adverse_checks" -gt 0 ] || [ "$adverse_statuses" -gt 0 ]; then
+            echo 'One or more configured independent assurance controls are adverse.'
+            jq '[.check_runs[] | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | {name, conclusion, html_url}]' /tmp/q1x-review/check-runs.json
+            jq '[.statuses[]? | select(.state == "failure" or .state == "error") | {context, state, target_url}]' /tmp/q1x-review/status.json
+            exit 1
+          fi
+          echo 'No completed adverse CircleCI/security/quality assurance check is present on this exact head.'
 
-      - name: Upload assurance evidence
-        uses: actions/upload-artifact@v4
+      - name: Record assurance summary
+        env:
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
+        run: |
+          jq -n \
+            --arg head "$EXPECTED_HEAD" \
+            --slurpfile checks /tmp/q1x-review/check-runs.json \
+            --slurpfile status /tmp/q1x-review/status.json \
+            '{
+              schema: "q1x.independent-assurance-evidence.v1",
+              exactHead: $head,
+              checks: [$checks[0].check_runs[] | {name, status, conclusion, app: (.app.slug // null), details_url}],
+              statuses: [$status[0].statuses[]? | {context, state, target_url}]
+            }' > /tmp/q1x-review/assurance-summary.json
+
+      - name: Upload exact-head review packet and assurance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: q1x-review-evidence-${{ inputs.pr_number }}-${{ inputs.head_sha }}
           path: /tmp/q1x-review
           retention-days: 14
 
-  semantic-independent-review:
-    needs: deterministic-assurance
-    if: ${{ inputs.run_semantic_review }}
+  ordinary-chat-dispatch-boundary:
+    needs: assurance-evidence
     runs-on: ubuntu-latest
     steps:
-      - name: Refuse implicit external reviewer selection
+      - name: Preserve the real Ordinary-Chat boundary
         run: |
-          echo 'No hosted semantic reviewer is selected implicitly.'
-          echo 'Normal Chat GPT-5.6 High remains the primary reviewer.'
-          echo 'The approved independent semantic reviewer must be connected through the Q1X reviewer bridge before this flag is enabled.'
-          exit 1
+          echo 'The installed Q1X PR Reviewer — Ordinary Chat app is the approved primary semantic-review surface.'
+          echo 'GitHub Actions prepares the exact-head request and assurance evidence automatically.'
+          echo 'This workflow does not substitute Codex, Work Chat, Anthropic, or an API-billed model for Ordinary Chat.'

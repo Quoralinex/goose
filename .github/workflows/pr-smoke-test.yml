@@ -40,9 +40,20 @@ jobs:
         id: filter
         with:
           base: ${{ github.event.before || github.event.pull_request.base.sha }}
+          predicate-quantifier: some-with-excludes
           filters: |
+            # Live provider/compaction tests exercise Goose runtime behavior.
+            # Repository metadata, Q1X thin-integration files, and this workflow
+            # itself are qualified by ordinary CI/review rather than provider credentials.
             code:
+              - '**'
               - '!documentation/**'
+              - '!.q1x-agent/**'
+              - '!plugins/q1x-code-review/**'
+              - '!.github/workflows/q1x-agent-plugin-validate.yml'
+              - '!.github/workflows/pr-smoke-test.yml'
+              - '!.github/workflows/mcp-conformance.yml'
+              - '!.github/workflows/ci.yml'
 
   build-binary:
     name: Build Binary

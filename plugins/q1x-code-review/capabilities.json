@@ -1,0 +1,12 @@
+{
+  "required": [
+    "github",
+    "goose-review"
+  ],
+  "optional": [
+    "remote-machine",
+    "systematic-debugging"
+  ],
+  "activationRule": "Installed capabilities remain dormant until selected for the repository and activated by the current task.",
+  "directControlPlaneDependency": false
+}

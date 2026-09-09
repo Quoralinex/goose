@@ -1,0 +1,28 @@
+{
+  "repository": "Quoralinex/goose",
+  "enabled": true,
+  "plugin": "q1x-code-review",
+  "profile": "code-reviewer",
+  "defaultBranch": "main",
+  "license": "Apache-2.0",
+  "skills": [
+    "repository-delivery",
+    "pr-review",
+    "security-validation",
+    "goose-review"
+  ],
+  "requiredCapabilities": [
+    "github",
+    "goose-review"
+  ],
+  "optionalCapabilities": [
+    "remote-machine",
+    "systematic-debugging"
+  ],
+  "permissions": {
+    "read": true,
+    "write": true,
+    "merge": "repository-policy"
+  },
+  "pluginVersion": "0.2.0"
+}

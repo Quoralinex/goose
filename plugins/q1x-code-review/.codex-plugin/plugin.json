@@ -1,0 +1,23 @@
+{
+  "name": "q1x-code-review",
+  "version": "0.2.0",
+  "description": "Q1X repository integration for Quoralinex/goose.",
+  "author": {
+    "name": "Quoralinex",
+    "url": "https://github.com/Quoralinex"
+  },
+  "license": "Apache-2.0",
+  "apps": "./.app.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Q1X: goose",
+    "shortDescription": "code-reviewer repository integration",
+    "developerName": "Quoralinex",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ]
+  }
+}

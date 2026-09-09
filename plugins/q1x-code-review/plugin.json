@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "q1x-code-review",
+  "version": "0.2.0",
+  "description": "Thin Q1X repository integration for Quoralinex/goose.",
+  "author": {
+    "name": "Quoralinex",
+    "url": "https://github.com/Quoralinex"
+  },
+  "license": "Apache-2.0"
+}

@@ -35,6 +35,12 @@ jobs:
           jq -e '.apps["q1x-agent-platform"].id == "REPLACE_WITH_Q1X_AGENT_APP_ID"' "$plugin/.app.json" >/dev/null
           test ! -e "$plugin/mcp.json"
           test ! -e "$plugin/.mcp.json"
+          # Q1X enrollment is metadata-only and must not consume live-provider
+          # credentials or Goose runtime minutes when no runtime code changed.
+          grep -Fq -- "- '!.q1x-agent/**'" .github/workflows/pr-smoke-test.yml
+          grep -Fq -- "- '!plugins/q1x-code-review/**'" .github/workflows/pr-smoke-test.yml
+          grep -Fq -- "- '!.github/workflows/q1x-agent-plugin-validate.yml'" .github/workflows/pr-smoke-test.yml
+          grep -Fq -- "- '!.github/workflows/pr-smoke-test.yml'" .github/workflows/pr-smoke-test.yml
           if grep -RniE 'q1x-control-plane|CONTROL_PLANE_PROD_API_KEY|Q1X_CONTROL_PLANE_URL' "$profile" "$plugin"; then
             echo 'Direct Q1X Control Plane coupling is prohibited in the Goose thin integration.' >&2
             exit 1

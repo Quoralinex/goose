@@ -53,6 +53,7 @@ jobs:
               - '!.github/workflows/q1x-agent-plugin-validate.yml'
               - '!.github/workflows/pr-smoke-test.yml'
               - '!.github/workflows/mcp-conformance.yml'
+              - '!.github/workflows/ci.yml'
 
   build-binary:
     name: Build Binary

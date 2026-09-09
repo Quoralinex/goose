@@ -98,8 +98,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev
+          # Ignore the unrelated preinstalled Chrome apt feed: hosted-runner
+          # mirror skew must not block Goose's Ubuntu build dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -y
+          sudo apt-get install -y libdbus-1-dev gnome-keyring libxcb1-dev
 
       - name: Build and Test
         run: |
@@ -124,8 +127,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y libdbus-1-dev libxcb1-dev
+          # Ignore the unrelated preinstalled Chrome apt feed: hosted-runner
+          # mirror skew must not block Goose's Ubuntu build dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -y
+          sudo apt-get install -y libdbus-1-dev libxcb1-dev
 
       - name: Check UniFFI feature
         run: |
@@ -165,8 +171,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev
+          # Ignore the unrelated preinstalled Chrome apt feed: hosted-runner
+          # mirror skew must not block Goose's Ubuntu build dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -y
+          sudo apt-get install -y libdbus-1-dev gnome-keyring libxcb1-dev
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
@@ -198,8 +207,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev
+          # Ignore the unrelated preinstalled Chrome apt feed: hosted-runner
+          # mirror skew must not block Goose's Ubuntu build dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -y
+          sudo apt-get install -y libdbus-1-dev gnome-keyring libxcb1-dev
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
@@ -265,8 +277,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y libdbus-1-dev libxcb1-dev
+          # Ignore the unrelated preinstalled Chrome apt feed: hosted-runner
+          # mirror skew must not block Goose's Ubuntu build dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -y
+          sudo apt-get install -y libdbus-1-dev libxcb1-dev
 
       - name: Repair stale v8 prebuilt marker
         run: .github/scripts/repair-v8-prebuilt.sh
@@ -311,8 +326,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y libdbus-1-dev libxcb1-dev
+          # Ignore the unrelated preinstalled Chrome apt feed: hosted-runner
+          # mirror skew must not block Goose's Ubuntu build dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -y
+          sudo apt-get install -y libdbus-1-dev libxcb1-dev
 
       - name: Install Node.js Dependencies
         run: |

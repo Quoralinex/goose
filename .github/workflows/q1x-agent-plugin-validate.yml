@@ -26,13 +26,13 @@ jobs:
           test -f "$profile"
           test -f "$plugin/plugin.json"
           test -f "$plugin/.codex-plugin/plugin.json"
-          test -f "$plugin/.app.json"
+          test ! -e "$plugin/.app.json"
           test -f "$plugin/capabilities.json"
           jq -e '.repository == "Quoralinex/goose" and .plugin == "q1x-code-review" and .profile == "code-reviewer" and .license == "Apache-2.0" and .pluginVersion == "0.2.0" and .permissions.merge == "repository-policy"' "$profile" >/dev/null
           jq -e '.name == "q1x-code-review" and .version == "0.2.0" and .license == "Apache-2.0"' "$plugin/plugin.json" >/dev/null
           jq -e '.name == "q1x-code-review" and .version == "0.2.0" and .license == "Apache-2.0"' "$plugin/.codex-plugin/plugin.json" >/dev/null
+          jq -e 'has("apps") | not' "$plugin/.codex-plugin/plugin.json" >/dev/null
           jq -e '.required == ["github", "goose-review"] and .directControlPlaneDependency == false' "$plugin/capabilities.json" >/dev/null
-          jq -e '.apps["q1x-agent-platform"].id == "REPLACE_WITH_Q1X_AGENT_APP_ID"' "$plugin/.app.json" >/dev/null
           test ! -e "$plugin/mcp.json"
           test ! -e "$plugin/.mcp.json"
           # Q1X enrollment is metadata-only and must not consume live-provider
@@ -43,6 +43,10 @@ jobs:
           grep -Fq -- "- '!plugins/q1x-code-review/**'" .github/workflows/pr-smoke-test.yml
           grep -Fq -- "- '!.github/workflows/q1x-agent-plugin-validate.yml'" .github/workflows/pr-smoke-test.yml
           grep -Fq -- "- '!.github/workflows/pr-smoke-test.yml'" .github/workflows/pr-smoke-test.yml
+          if grep -RniF 'REPLACE_WITH_Q1X_AGENT_APP_ID' "$plugin"; then
+            echo 'Placeholder ChatGPT app identifiers are prohibited in the thin integration.' >&2
+            exit 1
+          fi
           if grep -RniE 'q1x-control-plane|CONTROL_PLANE_PROD_API_KEY|Q1X_CONTROL_PLANE_URL' "$profile" "$plugin"; then
             echo 'Direct Q1X Control Plane coupling is prohibited in the Goose thin integration.' >&2
             exit 1

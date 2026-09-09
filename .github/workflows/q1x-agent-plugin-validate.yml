@@ -37,6 +37,8 @@ jobs:
           test ! -e "$plugin/.mcp.json"
           # Q1X enrollment is metadata-only and must not consume live-provider
           # credentials or Goose runtime minutes when no runtime code changed.
+          grep -Fq -- "predicate-quantifier: some-with-excludes" .github/workflows/pr-smoke-test.yml
+          grep -Fq -- "- '**'" .github/workflows/pr-smoke-test.yml
           grep -Fq -- "- '!.q1x-agent/**'" .github/workflows/pr-smoke-test.yml
           grep -Fq -- "- '!plugins/q1x-code-review/**'" .github/workflows/pr-smoke-test.yml
           grep -Fq -- "- '!.github/workflows/q1x-agent-plugin-validate.yml'" .github/workflows/pr-smoke-test.yml

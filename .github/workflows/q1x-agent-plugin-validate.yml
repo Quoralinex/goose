@@ -1,0 +1,41 @@
+name: Q1X Agent Plugin Validate
+
+on:
+  pull_request:
+    paths:
+      - '.q1x-agent/**'
+      - 'plugins/q1x-code-review/**'
+      - '.github/workflows/q1x-agent-plugin-validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Validate Q1X thin integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile='.q1x-agent/repository.json'
+          plugin='plugins/q1x-code-review'
+          test -f "$profile"
+          test -f "$plugin/plugin.json"
+          test -f "$plugin/.codex-plugin/plugin.json"
+          test -f "$plugin/.app.json"
+          test -f "$plugin/capabilities.json"
+          jq -e '.repository == "Quoralinex/goose" and .plugin == "q1x-code-review" and .profile == "code-reviewer" and .license == "Apache-2.0" and .pluginVersion == "0.2.0" and .permissions.merge == "repository-policy"' "$profile" >/dev/null
+          jq -e '.name == "q1x-code-review" and .version == "0.2.0" and .license == "Apache-2.0"' "$plugin/plugin.json" >/dev/null
+          jq -e '.name == "q1x-code-review" and .version == "0.2.0" and .license == "Apache-2.0"' "$plugin/.codex-plugin/plugin.json" >/dev/null
+          jq -e '.required == ["github", "goose-review"] and .directControlPlaneDependency == false' "$plugin/capabilities.json" >/dev/null
+          jq -e '.apps["q1x-agent-platform"].id == "REPLACE_WITH_Q1X_AGENT_APP_ID"' "$plugin/.app.json" >/dev/null
+          test ! -e "$plugin/mcp.json"
+          test ! -e "$plugin/.mcp.json"
+          if grep -RniE 'q1x-control-plane|CONTROL_PLANE_PROD_API_KEY|Q1X_CONTROL_PLANE_URL' "$profile" "$plugin"; then
+            echo 'Direct Q1X Control Plane coupling is prohibited in the Goose thin integration.' >&2
+            exit 1
+          fi

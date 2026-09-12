@@ -11,6 +11,11 @@ on:
         description: Exact pull request head SHA
         required: true
         type: string
+      require_independent_assurance:
+        description: Fail closed unless at least one configured independent assurance control completes cleanly
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       pr_number:
@@ -21,6 +26,11 @@ on:
         description: Exact pull request head SHA
         required: true
         type: string
+      require_independent_assurance:
+        description: Require configured independent assurance
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -49,6 +59,11 @@ jobs:
             'primary_review_surface=ordinary-chat' \
             'primary_review_model=gpt-5.6' \
             'primary_review_effort=high' \
+            'independent_reviewer=goose' \
+            'independent_review_provider=ordinary-chat' \
+            'independent_review_model=gpt-5.6' \
+            'independent_review_effort=high' \
+            'codex_semantic_review_authority=false' \
             'work_chat_dependency=false' \
             'codex_cloud_reviewer_dependency=false' \
             'anthropic_dependency=false' \
@@ -81,20 +96,89 @@ jobs:
             --argjson pr "$PR_NUMBER" \
             --arg head "$EXPECTED_HEAD" \
             '{
-              schema: "q1x.ordinary-chat-primary-review-request.v1",
-              callingSurface: "ordinary-chat",
-              reviewerModel: "GPT-5.6",
-              reviewerEffort: "High",
+              schema: "q1x.two-stage-semantic-review-request.v1",
               repository: $repository,
               pullRequestNumber: $pr,
               exactHead: $head,
-              instructions: "Perform the primary semantic code review against this exact head. Do not use Work Chat, Codex Cloud automatic review, or Anthropic/Claude."
+              primary: {
+                reviewer: "ordinary-chat",
+                model: "GPT-5.6",
+                effort: "High",
+                requiredStatus: "q1x/ordinary-chat-primary"
+              },
+              independent: {
+                reviewer: "goose",
+                provider: "ordinary-chat",
+                model: "GPT-5.6",
+                effort: "High",
+                requiredStatus: "q1x/goose-independent-review",
+                mustFollowPrimary: true
+              },
+              prohibitedSemanticProviders: ["codex", "work-chat", "anthropic", "ollama", "paid-api-substitute"]
             }' > /tmp/q1x-review/ordinary-chat-review-request.json
+
+      - name: Wait for Ordinary Chat primary and Goose independent semantic review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
+        run: |
+          set -u
+          primary_context='q1x/ordinary-chat-primary'
+          goose_context='q1x/goose-independent-review'
+          result_code=1
+          state='timeout-pending'
+          primary_time=''
+          goose_time=''
+
+          for attempt in $(seq 1 61); do
+            gh api -H 'Accept: application/vnd.github+json' \
+              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
+              > /tmp/q1x-review/semantic-check-runs.json
+            gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" \
+              > /tmp/q1x-review/semantic-status.json
+
+            adverse="$(jq --arg p "$primary_context" --arg g "$goose_context" '[.check_runs[] | select((.name == $p) or (.name == $g)) | select(.status == "completed") | select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length' /tmp/q1x-review/semantic-check-runs.json)"
+            adverse_status="$(jq --arg p "$primary_context" --arg g "$goose_context" '[.statuses[]? | select((.context == $p) or (.context == $g)) | select(.state == "failure" or .state == "error")] | length' /tmp/q1x-review/semantic-status.json)"
+            if [ $((adverse + adverse_status)) -gt 0 ]; then
+              state='adverse'
+              break
+            fi
+
+            primary_time="$( { jq -r --arg c "$primary_context" '.check_runs[] | select(.name == $c and .status == "completed" and .conclusion == "success") | .completed_at // empty' /tmp/q1x-review/semantic-check-runs.json; jq -r --arg c "$primary_context" '.statuses[]? | select(.context == $c and .state == "success") | .updated_at // .created_at // empty' /tmp/q1x-review/semantic-status.json; } | grep -E '.+' | sort | tail -1 )"
+            goose_time="$( { jq -r --arg c "$goose_context" '.check_runs[] | select(.name == $c and .status == "completed" and .conclusion == "success") | .completed_at // empty' /tmp/q1x-review/semantic-check-runs.json; jq -r --arg c "$goose_context" '.statuses[]? | select(.context == $c and .state == "success") | .updated_at // .created_at // empty' /tmp/q1x-review/semantic-status.json; } | grep -E '.+' | sort | tail -1 )"
+
+            if [ -n "$primary_time" ] && [ -n "$goose_time" ]; then
+              if [[ "$goose_time" < "$primary_time" ]]; then
+                state='invalid-order'
+                break
+              fi
+              state='completed-clean'
+              result_code=0
+              break
+            fi
+
+            sleep 20
+          done
+
+          jq -n \
+            --arg state "$state" \
+            --arg primaryContext "$primary_context" \
+            --arg gooseContext "$goose_context" \
+            --arg primaryCompletedAt "$primary_time" \
+            --arg gooseCompletedAt "$goose_time" \
+            '{schema:"q1x.two-stage-semantic-review-result.v1", state:$state, primaryContext:$primaryContext, gooseContext:$gooseContext, primaryCompletedAt:$primaryCompletedAt, gooseCompletedAt:$gooseCompletedAt}' \
+            > /tmp/q1x-review/semantic-review-result.json
+
+          if [ "$result_code" -ne 0 ]; then
+            echo "Two-stage semantic review failed closed: $state"
+            exit "$result_code"
+          fi
 
       - name: Wait for configured independent assurance and fail closed on adverse evidence
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_HEAD: ${{ inputs.head_sha }}
+          REQUIRE_ASSURANCE: ${{ inputs.require_independent_assurance }}
         run: |
           set -u
           regex='circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security'
@@ -133,7 +217,13 @@ jobs:
                 sleep 15
                 continue
               fi
-              state='no-configured-independent-assurance'
+              if [ "$REQUIRE_ASSURANCE" = "true" ]; then
+                state='no-configured-independent-assurance'
+                result_code=1
+              else
+                state='not-required'
+                result_code=0
+              fi
               break
             fi
 
@@ -177,15 +267,18 @@ jobs:
           test -f /tmp/q1x-review/check-runs.json || echo '{"check_runs":[]}' > /tmp/q1x-review/check-runs.json
           test -f /tmp/q1x-review/status.json || echo '{"statuses":[]}' > /tmp/q1x-review/status.json
           test -f /tmp/q1x-review/assurance-result.json || echo '{"schema":"q1x.independent-assurance-result.v1","state":"collection-error","relevantControls":0,"pendingControls":0,"adverseControls":0}' > /tmp/q1x-review/assurance-result.json
+          test -f /tmp/q1x-review/semantic-review-result.json || echo '{"schema":"q1x.two-stage-semantic-review-result.v1","state":"collection-error"}' > /tmp/q1x-review/semantic-review-result.json
           jq -n \
             --arg head "$EXPECTED_HEAD" \
             --slurpfile checks /tmp/q1x-review/check-runs.json \
             --slurpfile status /tmp/q1x-review/status.json \
             --slurpfile result /tmp/q1x-review/assurance-result.json \
+            --slurpfile semantic /tmp/q1x-review/semantic-review-result.json \
             '{
               schema: "q1x.independent-assurance-evidence.v1",
               exactHead: $head,
-              result: $result[0],
+              semanticReview: $semantic[0],
+              assurance: $result[0],
               checks: [$checks[0].check_runs[] | {name, status, conclusion, app: (.app.slug // null), details_url}],
               statuses: [$status[0].statuses[]? | {context, state, target_url}]
             }' > /tmp/q1x-review/assurance-summary.json
@@ -205,5 +298,5 @@ jobs:
       - name: Preserve the real Ordinary-Chat boundary
         run: |
           echo 'The installed Q1X PR Reviewer — Ordinary Chat app is the approved primary semantic-review surface.'
-          echo 'GitHub Actions prepares the exact-head request and waits for configured independent assurance automatically.'
-          echo 'This workflow does not substitute Codex, Work Chat, Anthropic, or an API-billed model for Ordinary Chat.'
+          echo 'GitHub Actions prepares the exact-head contract and requires Ordinary Chat primary review followed by Goose independent review on Ordinary Chat.'
+          echo 'Codex may initiate or transport the workflow but has no semantic-review authority. Work Chat, Anthropic, Ollama and API-billed substitutes are not semantic providers.'

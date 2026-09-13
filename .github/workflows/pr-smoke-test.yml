@@ -51,6 +51,7 @@ jobs:
               - '!.q1x-agent/**'
               - '!plugins/q1x-code-review/**'
               - '!.github/workflows/q1x-agent-plugin-validate.yml'
+              - '!.github/workflows/q1x-pr-review.yml'
               - '!.github/workflows/pr-smoke-test.yml'
               - '!.github/workflows/mcp-conformance.yml'
               - '!.github/workflows/ci.yml'

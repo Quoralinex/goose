@@ -51,10 +51,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_HEAD: ${{ inputs.head_sha }}
+          TRUSTED_REVIEWER_APP_ID: ${{ vars.Q1X_REVIEWER_APP_ID }}
+          TRUSTED_REVIEWER_APP_SLUG: ${{ vars.Q1X_REVIEWER_APP_SLUG }}
         run: |
           set -euo pipefail
           actual_head="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)"
           test "$actual_head" = "$EXPECTED_HEAD"
+          test -n "$TRUSTED_REVIEWER_APP_ID"
+          test -n "$TRUSTED_REVIEWER_APP_SLUG"
           printf '%s\n' \
             'primary_review_surface=ordinary-chat' \
             'primary_review_model=gpt-5.6' \
@@ -63,10 +67,15 @@ jobs:
             'independent_review_provider=ordinary-chat' \
             'independent_review_model=gpt-5.6' \
             'independent_review_effort=high' \
+            'semantic_evidence_transport=trusted-github-check-run-attestation' \
+            'semantic_commit_status_fallback=false' \
+            'semantic_attestation_schema=q1x.semantic-review-attestation.v1' \
             'codex_semantic_review_authority=false' \
             'work_chat_dependency=false' \
             'codex_cloud_reviewer_dependency=false' \
             'anthropic_dependency=false' \
+            "trusted_reviewer_app_id=$TRUSTED_REVIEWER_APP_ID" \
+            "trusted_reviewer_app_slug=$TRUSTED_REVIEWER_APP_SLUG" \
             "repository=$GITHUB_REPOSITORY" \
             "pr=$PR_NUMBER" \
             "head=$EXPECTED_HEAD"
@@ -81,7 +90,7 @@ jobs:
       checks: read
       statuses: read
     steps:
-      - name: Verify PR head and create Ordinary-Chat primary-review request packet
+      - name: Verify PR head and create two-stage semantic-review request packet
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -96,83 +105,262 @@ jobs:
             --argjson pr "$PR_NUMBER" \
             --arg head "$EXPECTED_HEAD" \
             '{
-              schema: "q1x.two-stage-semantic-review-request.v1",
+              schema: "q1x.two-stage-semantic-review-request.v2",
               repository: $repository,
               pullRequestNumber: $pr,
               exactHead: $head,
               primary: {
                 reviewer: "ordinary-chat",
-                model: "GPT-5.6",
-                effort: "High",
-                requiredStatus: "q1x/ordinary-chat-primary"
+                model: "gpt-5.6",
+                effort: "high",
+                requiredCheckRun: "q1x/ordinary-chat-primary"
               },
               independent: {
                 reviewer: "goose",
                 provider: "ordinary-chat",
-                model: "GPT-5.6",
-                effort: "High",
-                requiredStatus: "q1x/goose-independent-review",
-                mustFollowPrimary: true
+                model: "gpt-5.6",
+                effort: "high",
+                requiredCheckRun: "q1x/goose-independent-review",
+                mustFollowPrimary: true,
+                mustBindPrimaryAttestationDigest: true
+              },
+              attestation: {
+                schema: "q1x.semantic-review-attestation.v1",
+                transport: "github-check-run-output-summary",
+                trustedPublisher: "repository-configured-github-app",
+                digestAlgorithm: "sha256",
+                canonicalization: "utf8-json-sort-keys-compact",
+                commitStatusFallbackAllowed: false,
+                directVerdictConsumptionRequired: true
               },
               prohibitedSemanticProviders: ["codex", "work-chat", "anthropic", "ollama", "paid-api-substitute"]
             }' > /tmp/q1x-review/ordinary-chat-review-request.json
 
-      - name: Wait for Ordinary Chat primary and Goose independent semantic review
+      - name: Wait for verified digest-bound Ordinary Chat and Goose attestations
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_HEAD: ${{ inputs.head_sha }}
+          TRUSTED_REVIEWER_APP_ID: ${{ vars.Q1X_REVIEWER_APP_ID }}
+          TRUSTED_REVIEWER_APP_SLUG: ${{ vars.Q1X_REVIEWER_APP_SLUG }}
         run: |
-          set -u
-          primary_context='q1x/ordinary-chat-primary'
-          goose_context='q1x/goose-independent-review'
+          set -euo pipefail
+          test -n "$TRUSTED_REVIEWER_APP_ID"
+          test -n "$TRUSTED_REVIEWER_APP_SLUG"
+
+          cat > /tmp/q1x-review/verify_semantic_attestations.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          CHECKS = Path("/tmp/q1x-review/semantic-check-runs.json")
+          OUT = Path("/tmp/q1x-review/semantic-review-result.json")
+          PRIMARY = Path("/tmp/q1x-review/primary-attestation.json")
+          GOOSE = Path("/tmp/q1x-review/goose-attestation.json")
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          pr = int(os.environ["PR_NUMBER"])
+          head = os.environ["EXPECTED_HEAD"]
+          app_id = str(os.environ["TRUSTED_REVIEWER_APP_ID"])
+          app_slug = os.environ["TRUSTED_REVIEWER_APP_SLUG"]
+
+          def canonical_digest(payload):
+              body = dict(payload)
+              body.pop("attestationDigest", None)
+              encoded = json.dumps(
+                  body,
+                  sort_keys=True,
+                  separators=(",", ":"),
+                  ensure_ascii=False,
+              ).encode("utf-8")
+              return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+          def select_check(checks, name):
+              matches = []
+              for check in checks:
+                  app = check.get("app") or {}
+                  if (
+                      check.get("name") == name
+                      and check.get("status") == "completed"
+                      and check.get("head_sha") == head
+                      and str(app.get("id")) == app_id
+                      and app.get("slug") == app_slug
+                  ):
+                      matches.append(check)
+              if not matches:
+                  return None
+              matches.sort(key=lambda item: (
+                  item.get("completed_at") or "",
+                  item.get("id") or 0,
+              ))
+              return matches[-1]
+
+          def parse_attestation(check, expected):
+              output = check.get("output") or {}
+              summary = output.get("summary")
+              if not isinstance(summary, str) or not summary.strip():
+                  raise ValueError(f"{expected['stage']}: trusted check run has no JSON output.summary")
+              try:
+                  att = json.loads(summary)
+              except json.JSONDecodeError as exc:
+                  raise ValueError(f"{expected['stage']}: output.summary is not JSON: {exc}") from exc
+              required = {
+                  "schema": "q1x.semantic-review-attestation.v1",
+                  "repository": repo,
+                  "pullRequestNumber": pr,
+                  "exactHead": head,
+                  "stage": expected["stage"],
+                  "reviewer": expected["reviewer"],
+                  "surface": "ordinary-chat",
+                  "model": "gpt-5.6",
+                  "effort": "high",
+              }
+              for key, value in required.items():
+                  if att.get(key) != value:
+                      raise ValueError(
+                          f"{expected['stage']}: {key} mismatch "
+                          f"(expected {value!r}, got {att.get(key)!r})"
+                      )
+              for key in ("packetId", "evidenceDigest", "attestationDigest", "verdict"):
+                  if not isinstance(att.get(key), str) or not att[key]:
+                      raise ValueError(f"{expected['stage']}: missing {key}")
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", att["evidenceDigest"]):
+                  raise ValueError(f"{expected['stage']}: invalid evidenceDigest")
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", att["attestationDigest"]):
+                  raise ValueError(f"{expected['stage']}: invalid attestationDigest")
+              computed = canonical_digest(att)
+              if att["attestationDigest"] != computed:
+                  raise ValueError(
+                      f"{expected['stage']}: attestation digest mismatch "
+                      f"(expected {computed}, got {att['attestationDigest']})"
+                  )
+              if att["verdict"] not in {"pass", "findings", "abstain"}:
+                  raise ValueError(f"{expected['stage']}: invalid verdict {att['verdict']!r}")
+              return att
+
+          payload = json.loads(CHECKS.read_text())
+          checks = payload.get("check_runs") or []
+          primary_check = select_check(checks, "q1x/ordinary-chat-primary")
+          goose_check = select_check(checks, "q1x/goose-independent-review")
+          if primary_check is None or goose_check is None:
+              sys.exit(2)
+
+          try:
+              primary = parse_attestation(
+                  primary_check,
+                  {"stage": "ordinary-chat-primary", "reviewer": "ordinary-chat"},
+              )
+              goose = parse_attestation(
+                  goose_check,
+                  {"stage": "goose-independent", "reviewer": "goose"},
+              )
+
+              if primary_check.get("conclusion") != "success":
+                  raise ValueError("ordinary-chat-primary: trusted check conclusion is not success")
+              if goose_check.get("conclusion") != "success":
+                  raise ValueError("goose-independent: trusted check conclusion is not success")
+              if primary["verdict"] != "pass":
+                  raise ValueError(
+                      f"ordinary-chat-primary: direct verdict is {primary['verdict']!r}, not pass"
+                  )
+              if goose["verdict"] != "pass":
+                  raise ValueError(
+                      f"goose-independent: direct verdict is {goose['verdict']!r}, not pass"
+                  )
+              if goose.get("primaryAttestationDigest") != primary["attestationDigest"]:
+                  raise ValueError(
+                      "goose-independent: primaryAttestationDigest does not bind "
+                      "the accepted primary attestation"
+                  )
+              for key in ("advisoryId", "runtimePin"):
+                  if not isinstance(goose.get(key), str) or not goose[key]:
+                      raise ValueError(f"goose-independent: missing governed Goose {key}")
+
+              PRIMARY.write_text(json.dumps(primary, sort_keys=True, indent=2) + "\n")
+              GOOSE.write_text(json.dumps(goose, sort_keys=True, indent=2) + "\n")
+              result = {
+                  "schema": "q1x.two-stage-semantic-review-result.v2",
+                  "state": "completed-clean",
+                  "exactHead": head,
+                  "trustedPublisher": {
+                      "appId": app_id,
+                      "appSlug": app_slug,
+                  },
+                  "primary": {
+                      "checkRunId": primary_check.get("id"),
+                      "attestationDigest": primary["attestationDigest"],
+                      "evidenceDigest": primary["evidenceDigest"],
+                      "verdict": primary["verdict"],
+                      "packetId": primary["packetId"],
+                  },
+                  "goose": {
+                      "checkRunId": goose_check.get("id"),
+                      "attestationDigest": goose["attestationDigest"],
+                      "evidenceDigest": goose["evidenceDigest"],
+                      "verdict": goose["verdict"],
+                      "packetId": goose["packetId"],
+                      "advisoryId": goose["advisoryId"],
+                      "runtimePin": goose["runtimePin"],
+                      "primaryAttestationDigest": goose["primaryAttestationDigest"],
+                  },
+              }
+              OUT.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+          except ValueError as exc:
+              result = {
+                  "schema": "q1x.two-stage-semantic-review-result.v2",
+                  "state": "invalid-attestation",
+                  "exactHead": head,
+                  "error": str(exc),
+              }
+              OUT.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+              print(str(exc), file=sys.stderr)
+              sys.exit(3)
+          PY
+
           result_code=1
           state='timeout-pending'
-          primary_time=''
-          goose_time=''
-
           for attempt in $(seq 1 61); do
             gh api -H 'Accept: application/vnd.github+json' \
               "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
               > /tmp/q1x-review/semantic-check-runs.json
-            gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" \
-              > /tmp/q1x-review/semantic-status.json
 
-            adverse="$(jq --arg p "$primary_context" --arg g "$goose_context" '[.check_runs[] | select((.name == $p) or (.name == $g)) | select(.status == "completed") | select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length' /tmp/q1x-review/semantic-check-runs.json)"
-            adverse_status="$(jq --arg p "$primary_context" --arg g "$goose_context" '[.statuses[]? | select((.context == $p) or (.context == $g)) | select(.state == "failure" or .state == "error")] | length' /tmp/q1x-review/semantic-status.json)"
-            if [ $((adverse + adverse_status)) -gt 0 ]; then
-              state='adverse'
-              break
-            fi
+            set +e
+            python3 /tmp/q1x-review/verify_semantic_attestations.py
+            verifier_code=$?
+            set -e
 
-            primary_time="$( { jq -r --arg c "$primary_context" '.check_runs[] | select(.name == $c and .status == "completed" and .conclusion == "success") | .completed_at // empty' /tmp/q1x-review/semantic-check-runs.json; jq -r --arg c "$primary_context" '.statuses[]? | select(.context == $c and .state == "success") | .updated_at // .created_at // empty' /tmp/q1x-review/semantic-status.json; } | grep -E '.+' | sort | tail -1 )"
-            goose_time="$( { jq -r --arg c "$goose_context" '.check_runs[] | select(.name == $c and .status == "completed" and .conclusion == "success") | .completed_at // empty' /tmp/q1x-review/semantic-check-runs.json; jq -r --arg c "$goose_context" '.statuses[]? | select(.context == $c and .state == "success") | .updated_at // .created_at // empty' /tmp/q1x-review/semantic-status.json; } | grep -E '.+' | sort | tail -1 )"
-
-            if [ -n "$primary_time" ] && [ -n "$goose_time" ]; then
-              if [[ "$goose_time" < "$primary_time" ]]; then
-                state='invalid-order'
-                break
-              fi
+            if [ "$verifier_code" -eq 0 ]; then
               state='completed-clean'
               result_code=0
               break
             fi
-
+            if [ "$verifier_code" -eq 3 ]; then
+              state='invalid-attestation'
+              break
+            fi
+            if [ "$attempt" -eq 61 ]; then
+              break
+            fi
             sleep 20
           done
 
-          jq -n \
-            --arg state "$state" \
-            --arg primaryContext "$primary_context" \
-            --arg gooseContext "$goose_context" \
-            --arg primaryCompletedAt "$primary_time" \
-            --arg gooseCompletedAt "$goose_time" \
-            '{schema:"q1x.two-stage-semantic-review-result.v1", state:$state, primaryContext:$primaryContext, gooseContext:$gooseContext, primaryCompletedAt:$primaryCompletedAt, gooseCompletedAt:$gooseCompletedAt}' \
-            > /tmp/q1x-review/semantic-review-result.json
-
           if [ "$result_code" -ne 0 ]; then
-            echo "Two-stage semantic review failed closed: $state"
+            if [ ! -f /tmp/q1x-review/semantic-review-result.json ]; then
+              jq -n \
+                --arg state "$state" \
+                --arg head "$EXPECTED_HEAD" \
+                '{schema:"q1x.two-stage-semantic-review-result.v2", state:$state, exactHead:$head}' \
+                > /tmp/q1x-review/semantic-review-result.json
+            fi
+            echo "Verified two-stage semantic review failed closed: $state"
+            cat /tmp/q1x-review/semantic-review-result.json
             exit "$result_code"
           fi
+
+          cat /tmp/q1x-review/semantic-review-result.json
 
       - name: Wait for configured independent assurance and fail closed on adverse evidence
         env:
@@ -267,7 +455,7 @@ jobs:
           test -f /tmp/q1x-review/check-runs.json || echo '{"check_runs":[]}' > /tmp/q1x-review/check-runs.json
           test -f /tmp/q1x-review/status.json || echo '{"statuses":[]}' > /tmp/q1x-review/status.json
           test -f /tmp/q1x-review/assurance-result.json || echo '{"schema":"q1x.independent-assurance-result.v1","state":"collection-error","relevantControls":0,"pendingControls":0,"adverseControls":0}' > /tmp/q1x-review/assurance-result.json
-          test -f /tmp/q1x-review/semantic-review-result.json || echo '{"schema":"q1x.two-stage-semantic-review-result.v1","state":"collection-error"}' > /tmp/q1x-review/semantic-review-result.json
+          test -f /tmp/q1x-review/semantic-review-result.json || echo '{"schema":"q1x.two-stage-semantic-review-result.v2","state":"collection-error"}' > /tmp/q1x-review/semantic-review-result.json
           jq -n \
             --arg head "$EXPECTED_HEAD" \
             --slurpfile checks /tmp/q1x-review/check-runs.json \
@@ -275,11 +463,11 @@ jobs:
             --slurpfile result /tmp/q1x-review/assurance-result.json \
             --slurpfile semantic /tmp/q1x-review/semantic-review-result.json \
             '{
-              schema: "q1x.independent-assurance-evidence.v1",
+              schema: "q1x.independent-assurance-evidence.v2",
               exactHead: $head,
               semanticReview: $semantic[0],
               assurance: $result[0],
-              checks: [$checks[0].check_runs[] | {name, status, conclusion, app: (.app.slug // null), details_url}],
+              checks: [$checks[0].check_runs[] | {name, status, conclusion, app: {id: (.app.id // null), slug: (.app.slug // null)}, details_url}],
               statuses: [$status[0].statuses[]? | {context, state, target_url}]
             }' > /tmp/q1x-review/assurance-summary.json
 
@@ -298,5 +486,6 @@ jobs:
       - name: Preserve the real Ordinary-Chat boundary
         run: |
           echo 'The installed Q1X PR Reviewer — Ordinary Chat app is the approved primary semantic-review surface.'
-          echo 'GitHub Actions prepares the exact-head contract and requires Ordinary Chat primary review followed by Goose independent review on Ordinary Chat.'
+          echo 'The governed reviewer bridge must publish exact-head, digest-bound attestations through the configured trusted GitHub App.'
+          echo 'The Goose independent verdict is consumed directly only after its attestation binds the accepted primary attestation digest.'
           echo 'Codex may initiate or transport the workflow but has no semantic-review authority. Work Chat, Anthropic, Ollama and API-billed substitutes are not semantic providers.'

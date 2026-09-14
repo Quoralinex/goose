@@ -51,6 +51,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_HEAD: ${{ inputs.head_sha }}
+          # Trusted semantic reviewer identity is supplied by repository variables and verified by exact-head attestation checks.
           TRUSTED_REVIEWER_APP_ID: ${{ vars.Q1X_REVIEWER_APP_ID }}
           TRUSTED_REVIEWER_APP_SLUG: ${{ vars.Q1X_REVIEWER_APP_SLUG }}
         run: |

@@ -263,6 +263,15 @@ jobs:
                   raise ValueError("ordinary-chat-primary: trusted check conclusion is not success")
               if goose_check.get("conclusion") != "success":
                   raise ValueError("goose-independent: trusted check conclusion is not success")
+              primary_completed = primary_check.get("completed_at")
+              goose_completed = goose_check.get("completed_at")
+              if not primary_completed or not goose_completed:
+                  raise ValueError("trusted semantic checks must both include completed_at")
+              if goose_completed <= primary_completed:
+                  raise ValueError(
+                      "goose-independent: completed_at must be strictly later than "
+                      "ordinary-chat-primary completed_at"
+                  )
               if primary["verdict"] != "pass":
                   raise ValueError(
                       f"ordinary-chat-primary: direct verdict is {primary['verdict']!r}, not pass"
@@ -292,6 +301,7 @@ jobs:
                   },
                   "primary": {
                       "checkRunId": primary_check.get("id"),
+                      "completedAt": primary_completed,
                       "attestationDigest": primary["attestationDigest"],
                       "evidenceDigest": primary["evidenceDigest"],
                       "verdict": primary["verdict"],
@@ -299,6 +309,7 @@ jobs:
                   },
                   "goose": {
                       "checkRunId": goose_check.get("id"),
+                      "completedAt": goose_completed,
                       "attestationDigest": goose["attestationDigest"],
                       "evidenceDigest": goose["evidenceDigest"],
                       "verdict": goose["verdict"],
@@ -321,12 +332,16 @@ jobs:
               sys.exit(3)
           PY
 
+          collect_check_runs() {
+            gh api --paginate --slurp -H 'Accept: application/vnd.github+json' \
+              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
+              | jq '{check_runs: [.[].check_runs[]]}'
+          }
+
           result_code=1
           state='timeout-pending'
           for attempt in $(seq 1 61); do
-            gh api -H 'Accept: application/vnd.github+json' \
-              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
-              > /tmp/q1x-review/semantic-check-runs.json
+            collect_check_runs > /tmp/q1x-review/semantic-check-runs.json
 
             set +e
             python3 /tmp/q1x-review/verify_semantic_attestations.py
@@ -369,84 +384,233 @@ jobs:
           EXPECTED_HEAD: ${{ inputs.head_sha }}
           REQUIRE_ASSURANCE: ${{ inputs.require_independent_assurance }}
         run: |
-          set -u
+          set -euo pipefail
           regex='circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security'
-          result_code=0
+          result_code=1
           state='unknown'
-          relevant=0
-          pending=0
-          adverse=0
-          successful=0
+
+          cat > /tmp/q1x-review/classify_assurance.py <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          ADVERSE_CHECK_CONCLUSIONS = {
+              "failure",
+              "cancelled",
+              "timed_out",
+              "action_required",
+              "stale",
+              "startup_failure",
+          }
+          ADVERSE_STATUS_STATES = {"failure", "error"}
+
+          def classify(check_payload, status_payload, regex, require=True):
+              matcher = re.compile(regex, re.IGNORECASE)
+              checks = [
+                  check
+                  for check in check_payload.get("check_runs", [])
+                  if matcher.search(check.get("name") or "")
+              ]
+              statuses = [
+                  status
+                  for status in status_payload.get("statuses", [])
+                  if matcher.search(status.get("context") or "")
+              ]
+
+              relevant = len(checks) + len(statuses)
+              pending = sum(check.get("status") != "completed" for check in checks)
+              pending += sum(status.get("state") == "pending" for status in statuses)
+              adverse = sum(
+                  check.get("status") == "completed"
+                  and check.get("conclusion") in ADVERSE_CHECK_CONCLUSIONS
+                  for check in checks
+              )
+              adverse += sum(status.get("state") in ADVERSE_STATUS_STATES for status in statuses)
+              successful = sum(
+                  check.get("status") == "completed" and check.get("conclusion") == "success"
+                  for check in checks
+              )
+              successful += sum(status.get("state") == "success" for status in statuses)
+
+              if adverse:
+                  state = "adverse"
+              elif relevant == 0:
+                  state = "no-configured-independent-assurance" if require else "not-required"
+              elif pending:
+                  state = "pending"
+              elif require and successful == 0:
+                  state = "no-successful-independent-assurance"
+              else:
+                  state = "completed-clean"
+
+              return {
+                  "schema": "q1x.independent-assurance-result.v1",
+                  "state": state,
+                  "relevantControls": relevant,
+                  "pendingControls": pending,
+                  "adverseControls": adverse,
+                  "successfulControls": successful,
+              }
+
+          def self_test():
+              regex = r"security"
+
+              def check(status, conclusion):
+                  return {"name": "security-test", "status": status, "conclusion": conclusion}
+
+              def state(checks=(), statuses=(), require=True):
+                  result = classify(
+                      {"check_runs": list(checks)},
+                      {"statuses": [{"context": "security-status", "state": value} for value in statuses]},
+                      regex,
+                      require,
+                  )
+                  return result["state"]
+
+              cases = {
+                  "absent": (state(), "no-configured-independent-assurance"),
+                  "pending": (state(checks=[check("in_progress", None)]), "pending"),
+                  "success": (state(checks=[check("completed", "success")]), "completed-clean"),
+                  "skipped": (state(checks=[check("completed", "skipped")]), "no-successful-independent-assurance"),
+                  "neutral": (state(checks=[check("completed", "neutral")]), "no-successful-independent-assurance"),
+                  "adverse": (state(checks=[check("completed", "failure")]), "adverse"),
+                  "mixed-clean": (
+                      state(checks=[check("completed", "success"), check("completed", "neutral")]),
+                      "completed-clean",
+                  ),
+                  "mixed-adverse": (
+                      state(checks=[check("completed", "success"), check("completed", "failure")]),
+                      "adverse",
+                  ),
+              }
+              for name, (actual, expected) in cases.items():
+                  if actual != expected:
+                      raise AssertionError(f"{name}: expected {expected}, got {actual}")
+              print("assurance classifier self-tests: pass")
+
+          if __name__ == "__main__":
+              if sys.argv[1:] == ["--self-test"]:
+                  self_test()
+              else:
+                  checks = json.loads(Path(sys.argv[1]).read_text())
+                  statuses = json.loads(Path(sys.argv[2]).read_text())
+                  result = classify(checks, statuses, sys.argv[3], sys.argv[4].lower() == "true")
+                  print(json.dumps(result, sort_keys=True))
+          PY
+
+          python3 /tmp/q1x-review/classify_assurance.py --self-test
+
+          collect_check_runs() {
+            gh api --paginate --slurp -H 'Accept: application/vnd.github+json' \
+              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
+              | jq '{check_runs: [.[].check_runs[]]}'
+          }
+
+          write_collection_error_result() {
+            local source="$1"
+            jq -n --arg source "$source" '{
+              schema: "q1x.independent-assurance-result.v1",
+              state: "collection-error",
+              collectionError: $source,
+              relevantControls: 0,
+              pendingControls: 0,
+              adverseControls: 0,
+              successfulControls: 0
+            }' > /tmp/q1x-review/assurance-result.tmp
+            mv /tmp/q1x-review/assurance-result.tmp /tmp/q1x-review/assurance-result.json
+          }
+
+          retry_collection_failure() {
+            local source="$1"
+            local attempt="$2"
+            if [ "$attempt" -eq 46 ]; then
+              state='collection-error'
+              result_code=1
+              write_collection_error_result "$source"
+              return 1
+            fi
+            sleep 20
+            return 0
+          }
 
           for attempt in $(seq 1 46); do
-            gh api -H 'Accept: application/vnd.github+json' \
-              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
-              > /tmp/q1x-review/check-runs.json
-            gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" \
-              > /tmp/q1x-review/status.json
+            check_runs_tmp=/tmp/q1x-review/check-runs.attempt.json
+            status_tmp=/tmp/q1x-review/status.attempt.json
+            result_tmp=/tmp/q1x-review/assurance-result.attempt.json
+            rm -f "$check_runs_tmp" "$status_tmp" "$result_tmp"
 
-            relevant_checks="$(jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i"))] | length' /tmp/q1x-review/check-runs.json)"
-            relevant_statuses="$(jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i"))] | length' /tmp/q1x-review/status.json)"
-            pending_checks="$(jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i")) | select(.status != "completed")] | length' /tmp/q1x-review/check-runs.json)"
-            pending_statuses="$(jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i")) | select(.state == "pending")] | length' /tmp/q1x-review/status.json)"
-            adverse_checks="$(jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i")) | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "stale" or .conclusion == "startup_failure")] | length' /tmp/q1x-review/check-runs.json)"
-            successful_checks="$(jq --arg re "$regex" '[.check_runs[] | select(.name | test($re; "i")) | select(.status == "completed") | select(.conclusion == "success")] | length' /tmp/q1x-review/check-runs.json)"
-            adverse_statuses="$(jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i")) | select(.state == "failure" or .state == "error")] | length' /tmp/q1x-review/status.json)"
-            successful_statuses="$(jq --arg re "$regex" '[.statuses[]? | select(.context | test($re; "i")) | select(.state == "success")] | length' /tmp/q1x-review/status.json)"
-
-            relevant=$((relevant_checks + relevant_statuses))
-            pending=$((pending_checks + pending_statuses))
-            adverse=$((adverse_checks + adverse_statuses))
-            successful=$((successful_checks + successful_statuses))
-
-            if [ "$adverse" -gt 0 ]; then
-              state='adverse'
-              result_code=1
-              break
+            if ! collect_check_runs > "$check_runs_tmp"; then
+              rm -f "$check_runs_tmp"
+              if retry_collection_failure "check-runs" "$attempt"; then continue; else break; fi
             fi
+            if ! jq -e 'type == "object" and (.check_runs | type == "array")' "$check_runs_tmp" >/dev/null 2>&1; then
+              rm -f "$check_runs_tmp"
+              if retry_collection_failure "check-runs-json" "$attempt"; then continue; else break; fi
+            fi
+            mv "$check_runs_tmp" /tmp/q1x-review/check-runs.json
 
-            if [ "$relevant" -eq 0 ]; then
-              if [ "$attempt" -lt 3 ]; then
-                sleep 15
-                continue
-              fi
-              if [ "$REQUIRE_ASSURANCE" = "true" ]; then
-                state='no-configured-independent-assurance'
+            if ! gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" \
+              > "$status_tmp"; then
+              rm -f "$status_tmp"
+              if retry_collection_failure "status" "$attempt"; then continue; else break; fi
+            fi
+            if ! jq -e 'type == "object" and (.statuses | type == "array")' "$status_tmp" >/dev/null 2>&1; then
+              rm -f "$status_tmp"
+              if retry_collection_failure "status-json" "$attempt"; then continue; else break; fi
+            fi
+            mv "$status_tmp" /tmp/q1x-review/status.json
+
+            if ! python3 /tmp/q1x-review/classify_assurance.py \
+              /tmp/q1x-review/check-runs.json \
+              /tmp/q1x-review/status.json \
+              "$regex" \
+              "$REQUIRE_ASSURANCE" \
+              > "$result_tmp"; then
+              rm -f "$result_tmp"
+              if retry_collection_failure "classifier" "$attempt"; then continue; else break; fi
+            fi
+            if ! jq -e 'type == "object" and (.state | type == "string")' "$result_tmp" >/dev/null 2>&1; then
+              rm -f "$result_tmp"
+              if retry_collection_failure "classifier-json" "$attempt"; then continue; else break; fi
+            fi
+            mv "$result_tmp" /tmp/q1x-review/assurance-result.json
+
+            state="$(jq -r .state /tmp/q1x-review/assurance-result.json)"
+
+            case "$state" in
+              adverse|no-successful-independent-assurance)
                 result_code=1
-              else
-                state='not-required'
+                break
+                ;;
+              no-configured-independent-assurance)
+                if [ "$attempt" -lt 3 ]; then
+                  sleep 15
+                  continue
+                fi
+                result_code=1
+                break
+                ;;
+              not-required|completed-clean)
                 result_code=0
-              fi
-              break
-            fi
-
-            if [ "$pending" -eq 0 ]; then
-              if [ "$REQUIRE_ASSURANCE" = "true" ] && [ "$successful" -eq 0 ]; then
-                state='no-successful-independent-assurance'
-                result_code=1
-              else
-                state='completed-clean'
-              fi
-              break
-            fi
-
-            if [ "$attempt" -eq 46 ]; then
-              state='timeout-pending'
-              result_code=1
-              break
-            fi
-
-            sleep 20
+                break
+                ;;
+              pending)
+                if [ "$attempt" -eq 46 ]; then
+                  state='timeout-pending'
+                  jq '.state = "timeout-pending"' /tmp/q1x-review/assurance-result.json \
+                    > /tmp/q1x-review/assurance-result.tmp
+                  mv /tmp/q1x-review/assurance-result.tmp /tmp/q1x-review/assurance-result.json
+                  result_code=1
+                  break
+                fi
+                sleep 20
+                ;;
+              *)
+                if retry_collection_failure "classifier-state" "$attempt"; then continue; else break; fi
+                ;;
+            esac
           done
-
-          jq -n \
-            --arg state "$state" \
-            --argjson relevant "$relevant" \
-            --argjson pending "$pending" \
-            --argjson adverse "$adverse" \
-            --argjson successful "$successful" \
-            '{schema:"q1x.independent-assurance-result.v1", state:$state, relevantControls:$relevant, pendingControls:$pending, adverseControls:$adverse, successfulControls:$successful}' \
-            > /tmp/q1x-review/assurance-result.json
 
           if [ "$result_code" -ne 0 ]; then
             echo "Independent assurance failed closed: $state"
@@ -463,10 +627,18 @@ jobs:
           EXPECTED_HEAD: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          test -f /tmp/q1x-review/check-runs.json || echo '{"check_runs":[]}' > /tmp/q1x-review/check-runs.json
-          test -f /tmp/q1x-review/status.json || echo '{"statuses":[]}' > /tmp/q1x-review/status.json
-          test -f /tmp/q1x-review/assurance-result.json || echo '{"schema":"q1x.independent-assurance-result.v1","state":"collection-error","relevantControls":0,"pendingControls":0,"adverseControls":0,"successfulControls":0}' > /tmp/q1x-review/assurance-result.json
-          test -f /tmp/q1x-review/semantic-review-result.json || echo '{"schema":"q1x.two-stage-semantic-review-result.v2","state":"collection-error"}' > /tmp/q1x-review/semantic-review-result.json
+          normalize_json_file() {
+            local path="$1"
+            local fallback="$2"
+            if [ ! -s "$path" ] || ! jq -e . "$path" >/dev/null 2>&1; then
+              printf '%s\n' "$fallback" > "$path"
+            fi
+          }
+
+          normalize_json_file /tmp/q1x-review/check-runs.json '{"schema":"q1x.collection-error.v1","state":"collection-error","check_runs":[]}'
+          normalize_json_file /tmp/q1x-review/status.json '{"schema":"q1x.collection-error.v1","state":"collection-error","statuses":[]}'
+          normalize_json_file /tmp/q1x-review/assurance-result.json '{"schema":"q1x.independent-assurance-result.v1","state":"collection-error","relevantControls":0,"pendingControls":0,"adverseControls":0,"successfulControls":0}'
+          normalize_json_file /tmp/q1x-review/semantic-review-result.json '{"schema":"q1x.two-stage-semantic-review-result.v2","state":"collection-error"}'
           jq -n \
             --arg head "$EXPECTED_HEAD" \
             --slurpfile checks /tmp/q1x-review/check-runs.json \

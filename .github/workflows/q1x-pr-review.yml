@@ -507,17 +507,74 @@ jobs:
               | jq '{check_runs: [.[].check_runs[]]}'
           }
 
-          for attempt in $(seq 1 46); do
-            collect_check_runs > /tmp/q1x-review/check-runs.json
-            gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" \
-              > /tmp/q1x-review/status.json
+          write_collection_error_result() {
+            local source="$1"
+            jq -n --arg source "$source" '{
+              schema: "q1x.independent-assurance-result.v1",
+              state: "collection-error",
+              collectionError: $source,
+              relevantControls: 0,
+              pendingControls: 0,
+              adverseControls: 0,
+              successfulControls: 0
+            }' > /tmp/q1x-review/assurance-result.tmp
+            mv /tmp/q1x-review/assurance-result.tmp /tmp/q1x-review/assurance-result.json
+          }
 
-            python3 /tmp/q1x-review/classify_assurance.py \
+          retry_collection_failure() {
+            local source="$1"
+            local attempt="$2"
+            if [ "$attempt" -eq 46 ]; then
+              state='collection-error'
+              result_code=1
+              write_collection_error_result "$source"
+              return 1
+            fi
+            sleep 20
+            return 0
+          }
+
+          for attempt in $(seq 1 46); do
+            check_runs_tmp=/tmp/q1x-review/check-runs.attempt.json
+            status_tmp=/tmp/q1x-review/status.attempt.json
+            result_tmp=/tmp/q1x-review/assurance-result.attempt.json
+            rm -f "$check_runs_tmp" "$status_tmp" "$result_tmp"
+
+            if ! collect_check_runs > "$check_runs_tmp"; then
+              rm -f "$check_runs_tmp"
+              if retry_collection_failure "check-runs" "$attempt"; then continue; else break; fi
+            fi
+            if ! jq -e 'type == "object" and (.check_runs | type == "array")' "$check_runs_tmp" >/dev/null 2>&1; then
+              rm -f "$check_runs_tmp"
+              if retry_collection_failure "check-runs-json" "$attempt"; then continue; else break; fi
+            fi
+            mv "$check_runs_tmp" /tmp/q1x-review/check-runs.json
+
+            if ! gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/status" \
+              > "$status_tmp"; then
+              rm -f "$status_tmp"
+              if retry_collection_failure "status" "$attempt"; then continue; else break; fi
+            fi
+            if ! jq -e 'type == "object" and (.statuses | type == "array")' "$status_tmp" >/dev/null 2>&1; then
+              rm -f "$status_tmp"
+              if retry_collection_failure "status-json" "$attempt"; then continue; else break; fi
+            fi
+            mv "$status_tmp" /tmp/q1x-review/status.json
+
+            if ! python3 /tmp/q1x-review/classify_assurance.py \
               /tmp/q1x-review/check-runs.json \
               /tmp/q1x-review/status.json \
               "$regex" \
               "$REQUIRE_ASSURANCE" \
-              > /tmp/q1x-review/assurance-result.json
+              > "$result_tmp"; then
+              rm -f "$result_tmp"
+              if retry_collection_failure "classifier" "$attempt"; then continue; else break; fi
+            fi
+            if ! jq -e 'type == "object" and (.state | type == "string")' "$result_tmp" >/dev/null 2>&1; then
+              rm -f "$result_tmp"
+              if retry_collection_failure "classifier-json" "$attempt"; then continue; else break; fi
+            fi
+            mv "$result_tmp" /tmp/q1x-review/assurance-result.json
 
             state="$(jq -r .state /tmp/q1x-review/assurance-result.json)"
 
@@ -550,9 +607,7 @@ jobs:
                 sleep 20
                 ;;
               *)
-                state='classifier-error'
-                result_code=1
-                break
+                if retry_collection_failure "classifier-state" "$attempt"; then continue; else break; fi
                 ;;
             esac
           done
@@ -572,10 +627,18 @@ jobs:
           EXPECTED_HEAD: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          test -f /tmp/q1x-review/check-runs.json || echo '{"check_runs":[]}' > /tmp/q1x-review/check-runs.json
-          test -f /tmp/q1x-review/status.json || echo '{"statuses":[]}' > /tmp/q1x-review/status.json
-          test -f /tmp/q1x-review/assurance-result.json || echo '{"schema":"q1x.independent-assurance-result.v1","state":"collection-error","relevantControls":0,"pendingControls":0,"adverseControls":0,"successfulControls":0}' > /tmp/q1x-review/assurance-result.json
-          test -f /tmp/q1x-review/semantic-review-result.json || echo '{"schema":"q1x.two-stage-semantic-review-result.v2","state":"collection-error"}' > /tmp/q1x-review/semantic-review-result.json
+          normalize_json_file() {
+            local path="$1"
+            local fallback="$2"
+            if [ ! -s "$path" ] || ! jq -e . "$path" >/dev/null 2>&1; then
+              printf '%s\n' "$fallback" > "$path"
+            fi
+          }
+
+          normalize_json_file /tmp/q1x-review/check-runs.json '{"schema":"q1x.collection-error.v1","state":"collection-error","check_runs":[]}'
+          normalize_json_file /tmp/q1x-review/status.json '{"schema":"q1x.collection-error.v1","state":"collection-error","statuses":[]}'
+          normalize_json_file /tmp/q1x-review/assurance-result.json '{"schema":"q1x.independent-assurance-result.v1","state":"collection-error","relevantControls":0,"pendingControls":0,"adverseControls":0,"successfulControls":0}'
+          normalize_json_file /tmp/q1x-review/semantic-review-result.json '{"schema":"q1x.two-stage-semantic-review-result.v2","state":"collection-error"}'
           jq -n \
             --arg head "$EXPECTED_HEAD" \
             --slurpfile checks /tmp/q1x-review/check-runs.json \

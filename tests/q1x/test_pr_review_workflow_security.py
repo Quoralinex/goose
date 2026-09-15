@@ -1,4 +1,6 @@
 from pathlib import Path
+import re
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +82,27 @@ class Q1XAssuranceClassifierTests(unittest.TestCase):
             'successfulControls:$successful',
         ):
             self.assertIn(needle, REVIEW)
+
+
+class Q1XMergeAuthorityTests(unittest.TestCase):
+    def test_merge_authority_is_base_controlled_and_sha_pinned(self):
+        caller = (ROOT / ".github/workflows/q1x-goose-review.yml").read_text()
+        self.assertIn("\n  pull_request_target:\n", caller)
+        self.assertNotIn("\n  pull_request:\n", caller)
+        match = re.search(
+            r"uses:\s+Quoralinex/goose/\.github/workflows/q1x-pr-review\.yml@([0-9a-f]{40})",
+            caller,
+        )
+        self.assertIsNotNone(match, "merge-authoritative reusable workflow must use an immutable SHA")
+        pinned = subprocess.run(
+            ["git", "show", f"{match.group(1)}:.github/workflows/q1x-pr-review.yml"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual(REVIEW, pinned)
+        self.assertNotIn("uses: ./.github/workflows/q1x-pr-review.yml", caller)
 
 
 if __name__ == "__main__":

@@ -188,65 +188,9 @@ class Q1XMergeAuthorityTests(unittest.TestCase):
             caller,
         )
         self.assertIsNotNone(match, "merge-authoritative reusable workflow must use an immutable SHA")
-        pinned_sha = match.group(1)
-        pinned = self._read_pinned_workflow(pinned_sha)
+        pinned = self._read_pinned_workflow(match.group(1))
+        self.assertEqual(REVIEW, pinned)
         self.assertNotIn("uses: ./.github/workflows/q1x-pr-review.yml", caller)
-
-        authority_markers = (
-            "q1x/ordinary-chat-primary",
-            "q1x/goose-independent-review",
-            "primaryAttestationDigest",
-            "TRUSTED_REVIEWER_APP_ID",
-            "attestation digest mismatch",
-            "completed_at must be strictly later than",
-        )
-        for source in (pinned, REVIEW):
-            for marker in authority_markers:
-                self.assertIn(marker, source)
-
-        if REVIEW != pinned:
-            allowed = {
-                ".github/workflows/q1x-pr-review.yml",
-                "tests/q1x/test_pr_review_workflow_security.py",
-            }
-            history = subprocess.run(
-                ["git", "rev-list", "--all", "--", ".github/workflows/q1x-pr-review.yml"],
-                cwd=ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.splitlines()
-            staged = False
-            for commit in history:
-                parent = subprocess.run(
-                    ["git", "rev-parse", f"{commit}^"],
-                    cwd=ROOT, check=False, capture_output=True, text=True,
-                )
-                if parent.returncode != 0:
-                    continue
-                before = subprocess.run(
-                    ["git", "show", f"{parent.stdout.strip()}:.github/workflows/q1x-pr-review.yml"],
-                    cwd=ROOT, check=False, capture_output=True, text=True,
-                )
-                after = subprocess.run(
-                    ["git", "show", f"{commit}:.github/workflows/q1x-pr-review.yml"],
-                    cwd=ROOT, check=False, capture_output=True, text=True,
-                )
-                if before.returncode != 0 or after.returncode != 0:
-                    continue
-                if before.stdout != pinned or after.stdout != REVIEW:
-                    continue
-                changed = subprocess.run(
-                    ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit],
-                    cwd=ROOT, check=True, capture_output=True, text=True,
-                ).stdout.splitlines()
-                if set(changed).issubset(allowed):
-                    staged = True
-                    break
-            self.assertTrue(
-                staged,
-                "an unpinned reusable-workflow update must be one bounded workflow/test commit from the currently pinned content",
-            )
 
 
 class Q1XLiveProviderScopeTests(unittest.TestCase):

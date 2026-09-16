@@ -338,10 +338,49 @@ jobs:
               | jq '{check_runs: [.[].check_runs[]]}'
           }
 
+          write_semantic_collection_error_result() {
+            local source="$1"
+            jq -n \
+              --arg source "$source" \
+              --arg head "$EXPECTED_HEAD" \
+              '{
+                schema: "q1x.two-stage-semantic-review-result.v2",
+                state: "collection-error",
+                exactHead: $head,
+                collectionError: $source
+              }' > /tmp/q1x-review/semantic-review-result.tmp
+            mv /tmp/q1x-review/semantic-review-result.tmp /tmp/q1x-review/semantic-review-result.json
+          }
+
+          retry_semantic_collection_failure() {
+            local source="$1"
+            local attempt="$2"
+            if [ "$attempt" -eq 61 ]; then
+              state='collection-error'
+              result_code=1
+              rm -f /tmp/q1x-review/semantic-check-runs.json
+              write_semantic_collection_error_result "$source"
+              return 1
+            fi
+            sleep 20
+            return 0
+          }
+
           result_code=1
           state='timeout-pending'
           for attempt in $(seq 1 61); do
-            collect_check_runs > /tmp/q1x-review/semantic-check-runs.json
+            semantic_check_runs_tmp=/tmp/q1x-review/semantic-check-runs.attempt.json
+            rm -f "$semantic_check_runs_tmp"
+
+            if ! collect_check_runs > "$semantic_check_runs_tmp"; then
+              rm -f "$semantic_check_runs_tmp"
+              if retry_semantic_collection_failure "check-runs" "$attempt"; then continue; else break; fi
+            fi
+            if ! jq -e 'type == "object" and (.check_runs | type == "array")' "$semantic_check_runs_tmp" >/dev/null 2>&1; then
+              rm -f "$semantic_check_runs_tmp"
+              if retry_semantic_collection_failure "check-runs-json" "$attempt"; then continue; else break; fi
+            fi
+            mv "$semantic_check_runs_tmp" /tmp/q1x-review/semantic-check-runs.json
 
             set +e
             python3 /tmp/q1x-review/verify_semantic_attestations.py

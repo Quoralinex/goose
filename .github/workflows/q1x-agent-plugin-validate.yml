@@ -7,6 +7,7 @@ on:
       - 'plugins/q1x-code-review/**'
       - 'tests/q1x/**'
       - '.github/workflows/q1x-agent-plugin-validate.yml'
+      - '.github/workflows/pr-smoke-test.yml'
       - '.github/workflows/q1x-goose-review.yml'
       - '.github/workflows/q1x-pr-review.yml'
   workflow_dispatch:

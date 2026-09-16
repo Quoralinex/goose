@@ -52,6 +52,92 @@ class Q1XCheckRunCollectionTests(unittest.TestCase):
         self.assertIn("completed_at must be strictly later than", semantic_source)
 
 
+class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
+    def _extract_shell_function(self, name):
+        match = re.search(
+            rf"          {re.escape(name)}\(\) \{{\n(?P<body>.*?)\n          \}}",
+            REVIEW,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, f"{name} helper function is missing")
+        return f"{name}() {{\n" + textwrap.dedent(match.group("body")) + "\n}"
+
+    def test_transient_semantic_collection_failure_is_retryable(self):
+        self.assertIn("for attempt in $(seq 1 61); do", REVIEW)
+        self.assertIn('if ! collect_check_runs > "$semantic_check_runs_tmp"; then', REVIEW)
+        self.assertIn('retry_semantic_collection_failure "check-runs" "$attempt"', REVIEW)
+        self.assertIn('retry_semantic_collection_failure "check-runs-json" "$attempt"', REVIEW)
+        self.assertIn(
+            'mv "$semantic_check_runs_tmp" /tmp/q1x-review/semantic-check-runs.json',
+            REVIEW,
+        )
+
+        retry_source = self._extract_shell_function("retry_semantic_collection_failure")
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                "sleep() { :; }",
+                "write_semantic_collection_error_result() { :; }",
+                retry_source,
+                "attempts=0",
+                "success=0",
+                'source_cmd() { attempts=$((attempts + 1)); [ "$attempts" -gt 1 ]; }',
+                "state=unknown",
+                "result_code=0",
+                "for attempt in 1 2; do",
+                "  if ! source_cmd; then",
+                '    if retry_semantic_collection_failure "check-runs" "$attempt"; then continue; else break; fi',
+                "  fi",
+                "  success=1",
+                "  break",
+                "done",
+                'test "$success" -eq 1',
+                'test "$attempts" -eq 2',
+            ]
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_terminal_semantic_collection_failure_is_deterministic_and_fail_closed(self):
+        write_source = self._extract_shell_function("write_semantic_collection_error_result")
+        retry_source = self._extract_shell_function("retry_semantic_collection_failure")
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                "mkdir -p /tmp/q1x-review",
+                "rm -f /tmp/q1x-review/semantic-review-result.json /tmp/q1x-review/semantic-review-result.tmp",
+                "EXPECTED_HEAD=0123456789abcdef0123456789abcdef01234567",
+                "state=unknown",
+                "result_code=0",
+                "sleep() { :; }",
+                write_source,
+                retry_source,
+                "set +e",
+                'retry_semantic_collection_failure "check-runs-json" 61',
+                "terminal_code=$?",
+                "set -e",
+                'test "$terminal_code" -ne 0',
+                'test "$state" = "collection-error"',
+                'test "$result_code" -eq 1',
+                "jq -e '.schema == \"q1x.two-stage-semantic-review-result.v2\" and .state == \"collection-error\" and .exactHead == \"0123456789abcdef0123456789abcdef01234567\" and .collectionError == \"check-runs-json\"' /tmp/q1x-review/semantic-review-result.json >/dev/null",
+            ]
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+
 class Q1XAssuranceResilienceTests(unittest.TestCase):
     def test_transient_collection_and_classifier_failures_are_retryable(self):
         self.assertIn("for attempt in $(seq 1 46); do", REVIEW)
@@ -157,7 +243,6 @@ class Q1XAssuranceResilienceTests(unittest.TestCase):
                         text=True,
                     )
                     self.assertEqual(0, completed.returncode, completed.stderr)
-
 
 
 class Q1XMergeAuthorityTests(unittest.TestCase):

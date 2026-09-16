@@ -219,6 +219,8 @@ class Q1XLiveProviderScopeTests(unittest.TestCase):
     def test_q1x_security_tests_do_not_trigger_live_provider_credentials(self):
         smoke = (ROOT / ".github/workflows/pr-smoke-test.yml").read_text()
         self.assertIn("              - '!tests/q1x/**'", smoke)
+        validate = (ROOT / ".github/workflows/q1x-agent-plugin-validate.yml").read_text()
+        self.assertIn("      - '.github/workflows/pr-smoke-test.yml'", validate)
 
 
 if __name__ == "__main__":

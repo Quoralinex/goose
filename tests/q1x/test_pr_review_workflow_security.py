@@ -59,7 +59,9 @@ class Q1XAssuranceResilienceTests(unittest.TestCase):
         self.assertIn('retry_collection_failure "check-runs" "$attempt"', REVIEW)
         self.assertRegex(
             REVIEW,
-            r'if ! gh api "repos/\$GITHUB_REPOSITORY/commits/\$EXPECTED_HEAD/status" \\\n\s+> "\$status_tmp"; then',
+            r"if ! gh api --paginate --slurp -H 'Accept: application/vnd\.github\+json' \\\n"
+            r'\s+"repos/\$GITHUB_REPOSITORY/commits/\$EXPECTED_HEAD/status\?per_page=100" \\\n'
+            r"\s+\| jq '\{statuses: \[\.\[\]\.statuses\[\]\]\}' > \"\$status_tmp\"; then",
         )
         self.assertIn('retry_collection_failure "status" "$attempt"', REVIEW)
         self.assertIn('> "$result_tmp"; then', REVIEW)

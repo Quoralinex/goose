@@ -5,7 +5,11 @@ on:
     paths:
       - '.q1x-agent/**'
       - 'plugins/q1x-code-review/**'
+      - 'tests/q1x/**'
       - '.github/workflows/q1x-agent-plugin-validate.yml'
+      - '.github/workflows/pr-smoke-test.yml'
+      - '.github/workflows/q1x-goose-review.yml'
+      - '.github/workflows/q1x-pr-review.yml'
   workflow_dispatch:
 
 permissions:
@@ -17,6 +21,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
       - name: Validate Q1X thin integration
         shell: bash
         run: |
@@ -51,3 +57,6 @@ jobs:
             echo 'Direct Q1X Control Plane coupling is prohibited in the Goose thin integration.' >&2
             exit 1
           fi
+
+      - name: Run Q1X PR review security tests
+        run: python3 tests/q1x/test_pr_review_workflow_security.py

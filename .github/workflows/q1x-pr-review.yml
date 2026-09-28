@@ -271,11 +271,6 @@ jobs:
               goose_completed = goose_check.get("completed_at")
               if not primary_completed or not goose_completed:
                   raise ValueError("trusted semantic checks must both include completed_at")
-              if goose_completed <= primary_completed:
-                  raise RetryableCausalEvidence(
-                      "goose-independent: completed_at must be strictly later than "
-                      "ordinary-chat-primary completed_at; waiting for refreshed causal provenance"
-                  )
               if primary["verdict"] != "pass":
                   raise ValueError(
                       f"ordinary-chat-primary: direct verdict is {primary['verdict']!r}, not pass"
@@ -284,14 +279,24 @@ jobs:
                   raise ValueError(
                       f"goose-independent: direct verdict is {goose['verdict']!r}, not pass"
                   )
-              if goose.get("primaryAttestationDigest") != primary["attestationDigest"]:
+              primary_binding = goose.get("primaryAttestationDigest")
+              if not isinstance(primary_binding, str) or not re.fullmatch(
+                  r"sha256:[0-9a-f]{64}", primary_binding
+              ):
+                  raise ValueError("goose-independent: invalid primaryAttestationDigest")
+              for key in ("advisoryId", "runtimePin"):
+                  if not isinstance(goose.get(key), str) or not goose[key]:
+                      raise ValueError(f"goose-independent: missing governed Goose {key}")
+              if goose_completed <= primary_completed:
+                  raise RetryableCausalEvidence(
+                      "goose-independent: completed_at must be strictly later than "
+                      "ordinary-chat-primary completed_at; waiting for refreshed causal provenance"
+                  )
+              if primary_binding != primary["attestationDigest"]:
                   raise RetryableCausalEvidence(
                       "goose-independent: waiting for provenance that binds "
                       "the accepted primary attestation"
                   )
-              for key in ("advisoryId", "runtimePin"):
-                  if not isinstance(goose.get(key), str) or not goose[key]:
-                      raise ValueError(f"goose-independent: missing governed Goose {key}")
 
               PRIMARY.write_text(json.dumps(primary, sort_keys=True, indent=2) + "\n")
               GOOSE.write_text(json.dumps(goose, sort_keys=True, indent=2) + "\n")

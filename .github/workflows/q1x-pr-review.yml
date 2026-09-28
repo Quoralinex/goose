@@ -273,8 +273,8 @@ jobs:
                   raise ValueError("trusted semantic checks must both include completed_at")
               if goose_completed <= primary_completed:
                   raise RetryableCausalEvidence(
-                      "goose-independent: waiting for a completion strictly later than "
-                      "ordinary-chat-primary completed_at"
+                      "goose-independent: completed_at must be strictly later than "
+                      "ordinary-chat-primary completed_at; waiting for refreshed causal provenance"
                   )
               if primary["verdict"] != "pass":
                   raise ValueError(

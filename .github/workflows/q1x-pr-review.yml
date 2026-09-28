@@ -168,6 +168,9 @@ jobs:
           app_id = str(os.environ["TRUSTED_REVIEWER_APP_ID"])
           app_slug = os.environ["TRUSTED_REVIEWER_APP_SLUG"]
 
+          class RetryableCausalEvidence(Exception):
+              pass
+
           def canonical_digest(payload):
               body = dict(payload)
               body.pop("attestationDigest", None)
@@ -242,6 +245,7 @@ jobs:
                   raise ValueError(f"{expected['stage']}: invalid verdict {att['verdict']!r}")
               return att
 
+          OUT.unlink(missing_ok=True)
           payload = json.loads(CHECKS.read_text())
           checks = payload.get("check_runs") or []
           primary_check = select_check(checks, "q1x/ordinary-chat-primary")
@@ -268,8 +272,8 @@ jobs:
               if not primary_completed or not goose_completed:
                   raise ValueError("trusted semantic checks must both include completed_at")
               if goose_completed <= primary_completed:
-                  raise ValueError(
-                      "goose-independent: completed_at must be strictly later than "
+                  raise RetryableCausalEvidence(
+                      "goose-independent: waiting for a completion strictly later than "
                       "ordinary-chat-primary completed_at"
                   )
               if primary["verdict"] != "pass":
@@ -281,8 +285,8 @@ jobs:
                       f"goose-independent: direct verdict is {goose['verdict']!r}, not pass"
                   )
               if goose.get("primaryAttestationDigest") != primary["attestationDigest"]:
-                  raise ValueError(
-                      "goose-independent: primaryAttestationDigest does not bind "
+                  raise RetryableCausalEvidence(
+                      "goose-independent: waiting for provenance that binds "
                       "the accepted primary attestation"
                   )
               for key in ("advisoryId", "runtimePin"):
@@ -320,6 +324,9 @@ jobs:
                   },
               }
               OUT.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+          except RetryableCausalEvidence as exc:
+              print(str(exc), file=sys.stderr)
+              sys.exit(2)
           except ValueError as exc:
               result = {
                   "schema": "q1x.two-stage-semantic-review-result.v2",

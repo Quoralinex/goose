@@ -245,7 +245,22 @@ jobs:
                   raise ValueError(f"{expected['stage']}: invalid verdict {att['verdict']!r}")
               return att
 
-          OUT.unlink(missing_ok=True)
+          # Preserve a terminal hard-failure result across later retryable observations.
+          # A successful or new hard-failure verification below will replace it.
+          if OUT.exists():
+              try:
+                  existing_result = json.loads(OUT.read_text())
+              except (json.JSONDecodeError, OSError):
+                  OUT.unlink(missing_ok=True)
+              else:
+                  preserve_terminal = (
+                      existing_result.get("schema") == "q1x.two-stage-semantic-review-result.v2"
+                      and existing_result.get("state") == "invalid-attestation"
+                      and existing_result.get("exactHead") == head
+                  )
+                  if not preserve_terminal:
+                      OUT.unlink(missing_ok=True)
+
           payload = json.loads(CHECKS.read_text())
           checks = payload.get("check_runs") or []
           primary_check = select_check(checks, "q1x/ordinary-chat-primary")

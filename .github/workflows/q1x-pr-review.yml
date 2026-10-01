@@ -168,6 +168,9 @@ jobs:
           app_id = str(os.environ["TRUSTED_REVIEWER_APP_ID"])
           app_slug = os.environ["TRUSTED_REVIEWER_APP_SLUG"]
 
+          class RetryableCausalEvidence(Exception):
+              pass
+
           def canonical_digest(payload):
               body = dict(payload)
               body.pop("attestationDigest", None)
@@ -242,6 +245,22 @@ jobs:
                   raise ValueError(f"{expected['stage']}: invalid verdict {att['verdict']!r}")
               return att
 
+          # Preserve a terminal hard-failure result across later retryable observations.
+          # A successful or new hard-failure verification below will replace it.
+          if OUT.exists():
+              try:
+                  existing_result = json.loads(OUT.read_text())
+              except (json.JSONDecodeError, OSError):
+                  OUT.unlink(missing_ok=True)
+              else:
+                  preserve_terminal = (
+                      existing_result.get("schema") == "q1x.two-stage-semantic-review-result.v2"
+                      and existing_result.get("state") == "invalid-attestation"
+                      and existing_result.get("exactHead") == head
+                  )
+                  if not preserve_terminal:
+                      OUT.unlink(missing_ok=True)
+
           payload = json.loads(CHECKS.read_text())
           checks = payload.get("check_runs") or []
           primary_check = select_check(checks, "q1x/ordinary-chat-primary")
@@ -267,11 +286,6 @@ jobs:
               goose_completed = goose_check.get("completed_at")
               if not primary_completed or not goose_completed:
                   raise ValueError("trusted semantic checks must both include completed_at")
-              if goose_completed <= primary_completed:
-                  raise ValueError(
-                      "goose-independent: completed_at must be strictly later than "
-                      "ordinary-chat-primary completed_at"
-                  )
               if primary["verdict"] != "pass":
                   raise ValueError(
                       f"ordinary-chat-primary: direct verdict is {primary['verdict']!r}, not pass"
@@ -280,14 +294,24 @@ jobs:
                   raise ValueError(
                       f"goose-independent: direct verdict is {goose['verdict']!r}, not pass"
                   )
-              if goose.get("primaryAttestationDigest") != primary["attestationDigest"]:
-                  raise ValueError(
-                      "goose-independent: primaryAttestationDigest does not bind "
-                      "the accepted primary attestation"
-                  )
+              primary_binding = goose.get("primaryAttestationDigest")
+              if not isinstance(primary_binding, str) or not re.fullmatch(
+                  r"sha256:[0-9a-f]{64}", primary_binding
+              ):
+                  raise ValueError("goose-independent: invalid primaryAttestationDigest")
               for key in ("advisoryId", "runtimePin"):
                   if not isinstance(goose.get(key), str) or not goose[key]:
                       raise ValueError(f"goose-independent: missing governed Goose {key}")
+              if goose_completed <= primary_completed:
+                  raise RetryableCausalEvidence(
+                      "goose-independent: completed_at must be strictly later than "
+                      "ordinary-chat-primary completed_at; waiting for refreshed causal provenance"
+                  )
+              if primary_binding != primary["attestationDigest"]:
+                  raise RetryableCausalEvidence(
+                      "goose-independent: waiting for provenance that binds "
+                      "the accepted primary attestation"
+                  )
 
               PRIMARY.write_text(json.dumps(primary, sort_keys=True, indent=2) + "\n")
               GOOSE.write_text(json.dumps(goose, sort_keys=True, indent=2) + "\n")
@@ -320,6 +344,30 @@ jobs:
                   },
               }
               OUT.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+          except RetryableCausalEvidence as exc:
+              # Preserve any exact-head terminal hard failure. Otherwise persist
+              # the causal retry reason so a later timeout remains diagnosable.
+              preserve_terminal = False
+              if OUT.exists():
+                  try:
+                      existing_result = json.loads(OUT.read_text())
+                  except (json.JSONDecodeError, OSError):
+                      existing_result = {}
+                  preserve_terminal = (
+                      existing_result.get("schema") == "q1x.two-stage-semantic-review-result.v2"
+                      and existing_result.get("state") == "invalid-attestation"
+                      and existing_result.get("exactHead") == head
+                  )
+              if not preserve_terminal:
+                  retry_result = {
+                      "schema": "q1x.two-stage-semantic-review-result.v2",
+                      "state": "causal-provenance-pending",
+                      "exactHead": head,
+                      "retryReason": str(exc),
+                  }
+                  OUT.write_text(json.dumps(retry_result, sort_keys=True, indent=2) + "\n")
+              print(str(exc), file=sys.stderr)
+              sys.exit(2)
           except ValueError as exc:
               result = {
                   "schema": "q1x.two-stage-semantic-review-result.v2",

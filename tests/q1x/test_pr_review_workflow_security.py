@@ -52,6 +52,32 @@ class Q1XCheckRunCollectionTests(unittest.TestCase):
         self.assertIn("completed_at must be strictly later than", semantic_source)
 
 
+def run_semantic_verifier(check_payload, existing_result=None):
+    source = extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "semantic-check-runs.json").write_text(__import__("json").dumps(check_payload))
+        if existing_result is not None:
+            (root / "semantic-review-result.json").write_text(__import__("json").dumps(existing_result))
+        patched = source.replace('Path("/tmp/q1x-review")', f'Path({str(root)!r})')
+        completed = subprocess.run(
+            ["python3", "-c", patched],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **__import__("os").environ,
+                "EXPECTED_HEAD": "0123456789abcdef0123456789abcdef01234567",
+                "TRUSTED_REVIEWER_APP_ID": "1",
+                "TRUSTED_REVIEWER_APP_SLUG": "q1x-reviewer",
+            },
+        )
+        result_path = root / "semantic-review-result.json"
+        result = __import__("json").loads(result_path.read_text()) if result_path.exists() else None
+        return completed, result
+
+
 class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
     def _extract_shell_function(self, name):
         match = re.search(
@@ -61,6 +87,21 @@ class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
         )
         self.assertIsNotNone(match, f"{name} helper function is missing")
         return f"{name}() {{\n" + textwrap.dedent(match.group("body")) + "\n}"
+
+    def test_retryable_causal_reason_is_durable_without_replacing_terminal_failure(self):
+        semantic_source = extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py")
+        self.assertIn('"state": "causal-provenance-pending"', semantic_source)
+        self.assertIn('"retryReason": str(exc)', semantic_source)
+        self.assertIn("if not preserve_terminal:", semantic_source)
+
+    def test_retryable_paths_and_hard_failure_persistence_are_outcome_covered(self):
+        semantic_source = extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py")
+        self.assertIn("raise RetryableCausalEvidence(", semantic_source)
+        self.assertIn("goose_completed <= primary_completed", semantic_source)
+        self.assertIn('primary_binding != primary[\"attestationDigest\"]', semantic_source)
+        self.assertIn('raise ValueError("goose-independent: invalid primaryAttestationDigest")', semantic_source)
+        self.assertIn('existing_result.get("state") == "invalid-attestation"', semantic_source)
+        self.assertIn('OUT.write_text(json.dumps(result, sort_keys=True, indent=2)', semantic_source)
 
     def test_transient_semantic_collection_failure_is_retryable(self):
         self.assertIn("for attempt in $(seq 1 61); do", REVIEW)

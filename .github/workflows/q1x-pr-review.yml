@@ -345,6 +345,27 @@ jobs:
               }
               OUT.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
           except RetryableCausalEvidence as exc:
+              # Preserve any exact-head terminal hard failure. Otherwise persist
+              # the causal retry reason so a later timeout remains diagnosable.
+              preserve_terminal = False
+              if OUT.exists():
+                  try:
+                      existing_result = json.loads(OUT.read_text())
+                  except (json.JSONDecodeError, OSError):
+                      existing_result = {}
+                  preserve_terminal = (
+                      existing_result.get("schema") == "q1x.two-stage-semantic-review-result.v2"
+                      and existing_result.get("state") == "invalid-attestation"
+                      and existing_result.get("exactHead") == head
+                  )
+              if not preserve_terminal:
+                  retry_result = {
+                      "schema": "q1x.two-stage-semantic-review-result.v2",
+                      "state": "causal-provenance-pending",
+                      "exactHead": head,
+                      "retryReason": str(exc),
+                  }
+                  OUT.write_text(json.dumps(retry_result, sort_keys=True, indent=2) + "\n")
               print(str(exc), file=sys.stderr)
               sys.exit(2)
           except ValueError as exc:

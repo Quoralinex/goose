@@ -53,13 +53,13 @@ class Q1XCheckRunCollectionTests(unittest.TestCase):
 
 
 def run_semantic_verifier(check_payload, existing_result=None):
-    source = extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py")
+    source = textwrap.dedent(extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py"))
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         (root / "semantic-check-runs.json").write_text(__import__("json").dumps(check_payload))
         if existing_result is not None:
             (root / "semantic-review-result.json").write_text(__import__("json").dumps(existing_result))
-        patched = source.replace('Path("/tmp/q1x-review")', f'Path({str(root)!r})')
+        patched = source.replace("/tmp/q1x-review", str(root))
         completed = subprocess.run(
             ["python3", "-c", patched],
             cwd=ROOT,
@@ -68,6 +68,8 @@ def run_semantic_verifier(check_payload, existing_result=None):
             text=True,
             env={
                 **__import__("os").environ,
+                "GITHUB_REPOSITORY": "Quoralinex/goose",
+                "PR_NUMBER": "7",
                 "EXPECTED_HEAD": "0123456789abcdef0123456789abcdef01234567",
                 "TRUSTED_REVIEWER_APP_ID": "1",
                 "TRUSTED_REVIEWER_APP_SLUG": "q1x-reviewer",
@@ -88,20 +90,56 @@ class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
         self.assertIsNotNone(match, f"{name} helper function is missing")
         return f"{name}() {{\n" + textwrap.dedent(match.group("body")) + "\n}"
 
-    def test_retryable_causal_reason_is_durable_without_replacing_terminal_failure(self):
-        semantic_source = extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py")
-        self.assertIn('"state": "causal-provenance-pending"', semantic_source)
-        self.assertIn('"retryReason": str(exc)', semantic_source)
-        self.assertIn("if not preserve_terminal:", semantic_source)
+    def _attestation(self, stage, reviewer, verdict="pass", **extra):
+        import hashlib, json
+        payload = {"schema":"q1x.semantic-review-attestation.v1","repository":"Quoralinex/goose","pullRequestNumber":7,"exactHead":"0123456789abcdef0123456789abcdef01234567","stage":stage,"reviewer":reviewer,"surface":"ordinary-chat","model":"gpt-5.6","effort":"high","packetId":f"{stage}-packet","evidenceDigest":"sha256:"+"1"*64,"verdict":verdict,**extra}
+        encoded=json.dumps(payload,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+        payload["attestationDigest"]="sha256:"+hashlib.sha256(encoded).hexdigest()
+        return payload
 
-    def test_retryable_paths_and_hard_failure_persistence_are_outcome_covered(self):
-        semantic_source = extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py")
-        self.assertIn("raise RetryableCausalEvidence(", semantic_source)
-        self.assertIn("goose_completed <= primary_completed", semantic_source)
-        self.assertIn('primary_binding != primary[\"attestationDigest\"]', semantic_source)
-        self.assertIn('raise ValueError("goose-independent: invalid primaryAttestationDigest")', semantic_source)
-        self.assertIn('existing_result.get("state") == "invalid-attestation"', semantic_source)
-        self.assertIn('OUT.write_text(json.dumps(result, sort_keys=True, indent=2)', semantic_source)
+    def _check(self, name, attestation, completed_at, check_id):
+        import json
+        return {"id":check_id,"name":name,"status":"completed","conclusion":"success","head_sha":"0123456789abcdef0123456789abcdef01234567","completed_at":completed_at,"app":{"id":1,"slug":"q1x-reviewer"},"output":{"summary":json.dumps(attestation)}}
+
+    def _payload(self, goose_completed="2026-10-01T02:01:00Z", binding=None):
+        primary=self._attestation("ordinary-chat-primary","ordinary-chat")
+        goose=self._attestation("goose-independent","goose",advisoryId="advisory-1",runtimePin="ordinary-chat-gpt-5.6-high",primaryAttestationDigest=binding or primary["attestationDigest"])
+        return {"check_runs":[self._check("q1x/ordinary-chat-primary",primary,"2026-10-01T02:00:00Z",1),self._check("q1x/goose-independent-review",goose,goose_completed,2)]}, primary
+
+    def test_stale_goose_completion_persists_retry_reason(self):
+        payload,_=self._payload(goose_completed="2026-10-01T01:59:00Z")
+        completed,result=run_semantic_verifier(payload)
+        self.assertEqual(2,completed.returncode,completed.stderr)
+        self.assertEqual("causal-provenance-pending",result["state"])
+        self.assertIn("strictly later",result["retryReason"])
+
+    def test_superseded_primary_binding_persists_retry_reason(self):
+        payload,_=self._payload(binding="sha256:"+"2"*64)
+        completed,result=run_semantic_verifier(payload)
+        self.assertEqual(2,completed.returncode,completed.stderr)
+        self.assertEqual("causal-provenance-pending",result["state"])
+        self.assertIn("binds the accepted primary",result["retryReason"])
+
+    def test_malformed_primary_binding_is_terminal(self):
+        import hashlib,json
+        payload,_=self._payload()
+        check=payload["check_runs"][1]
+        goose=json.loads(check["output"]["summary"])
+        goose["primaryAttestationDigest"]="not-a-digest"
+        goose.pop("attestationDigest")
+        encoded=json.dumps(goose,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+        goose["attestationDigest"]="sha256:"+hashlib.sha256(encoded).hexdigest()
+        check["output"]["summary"]=json.dumps(goose)
+        completed,result=run_semantic_verifier(payload)
+        self.assertEqual(3,completed.returncode,completed.stderr)
+        self.assertEqual("invalid-attestation",result["state"])
+
+    def test_retryable_observation_preserves_terminal_result(self):
+        payload,_=self._payload(goose_completed="2026-10-01T01:59:00Z")
+        terminal={"schema":"q1x.two-stage-semantic-review-result.v2","state":"invalid-attestation","exactHead":"0123456789abcdef0123456789abcdef01234567","error":"prior terminal failure"}
+        completed,result=run_semantic_verifier(payload,terminal)
+        self.assertEqual(2,completed.returncode,completed.stderr)
+        self.assertEqual(terminal,result)
 
     def test_transient_semantic_collection_failure_is_retryable(self):
         self.assertIn("for attempt in $(seq 1 61); do", REVIEW)

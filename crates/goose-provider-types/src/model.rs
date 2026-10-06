@@ -117,21 +117,36 @@ impl ModelConfig {
         config
     }
 
-    pub fn with_canonical_limits(mut self, provider_name: &str) -> Self {
+    fn canonical_model(&self, provider_name: &str) -> Option<crate::canonical::CanonicalModel> {
         // Try canonical lookup with the full model name first, then fall back
         // to the name with reasoning-effort suffixes stripped (e.g.
         // "databricks-gpt-5.4-high" → "databricks-gpt-5.4").
-        let canonical =
-            crate::canonical::maybe_get_canonical_model(provider_name, &self.model_name).or_else(
-                || {
-                    let (base, _effort) = extract_reasoning_effort(&self.model_name);
-                    if base != self.model_name {
-                        crate::canonical::maybe_get_canonical_model(provider_name, &base)
-                    } else {
-                        None
-                    }
-                },
-            );
+        crate::canonical::maybe_get_canonical_model(provider_name, &self.model_name).or_else(|| {
+            let (base, _effort) = extract_reasoning_effort(&self.model_name);
+            if base != self.model_name {
+                crate::canonical::maybe_get_canonical_model(provider_name, &base)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn with_canonical_vision_support(mut self, provider_name: &str) -> Self {
+        if self.supports_vision.is_none() {
+            if let Some(canonical) = self.canonical_model(provider_name) {
+                self.supports_vision = Some(
+                    canonical
+                        .modalities
+                        .input
+                        .contains(&crate::canonical::Modality::Image),
+                );
+            }
+        }
+        self
+    }
+
+    pub fn with_canonical_limits(mut self, provider_name: &str) -> Self {
+        let canonical = self.canonical_model(provider_name);
 
         if let Some(canonical) = canonical {
             if self.max_tokens.is_none() {
@@ -282,7 +297,41 @@ impl ModelConfig {
         self.is_openai_reasoning_model()
             || self.model_name.to_lowercase().contains("claude")
             || Self::is_gemini3_reasoning_model_name(&self.model_name)
+            || self.is_glm_5_3_reasoning_model()
+            || self.is_kimi_k3_reasoning_model()
             || is_xai_reasoning_model(&self.model_name)
+    }
+
+    pub fn is_glm_5_3_reasoning_model(&self) -> bool {
+        let name = self
+            .model_name
+            .splitn(3, '.')
+            .nth(2)
+            .unwrap_or(&self.model_name);
+        let lower = name.to_lowercase();
+        let segments: Vec<_> = lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        segments
+            .windows(3)
+            .any(|segments| segments == ["glm", "5", "3"])
+    }
+
+    pub fn is_kimi_k3_reasoning_model(&self) -> bool {
+        let name = self
+            .model_name
+            .splitn(3, '.')
+            .nth(2)
+            .unwrap_or(&self.model_name);
+        let lower = name.to_lowercase();
+        let segments: Vec<_> = lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        segments
+            .windows(2)
+            .any(|segments| segments == ["kimi", "k3"])
     }
 
     fn is_gemini3_reasoning_model_name(model_name: &str) -> bool {
@@ -967,9 +1016,36 @@ mod tests {
             assert!(ModelConfig::new("o3-mini").is_reasoning_model());
             assert!(ModelConfig::new("claude-sonnet-4").is_reasoning_model());
             assert!(ModelConfig::new("gemini-3-pro").is_reasoning_model());
+            assert!(ModelConfig::new("glm-5.3").is_reasoning_model());
+            assert!(
+                ModelConfig::new("data_workflow_tools.goose.goose-glm-5-3").is_reasoning_model()
+            );
+            assert!(!ModelConfig::new("glm-5.30").is_reasoning_model());
+            assert!(!ModelConfig::new("glm_5_3_models.prod.llama-3").is_reasoning_model());
             assert!(ModelConfig::new("grok-4.5").is_reasoning_model());
             assert!(ModelConfig::new("grok-4.20-0309-reasoning").is_reasoning_model());
             assert!(!ModelConfig::new("grok-4.20-0309-non-reasoning").is_reasoning_model());
+        }
+
+        #[test]
+        fn recognizes_kimi_k3_without_matching_other_versions() {
+            for model in [
+                "kimi-k3",
+                "moonshotai/kimi-k3",
+                "catalog.schema.goose-kimi-k3",
+                "Kimi-K3",
+            ] {
+                assert!(ModelConfig::new(model).is_reasoning_model(), "{model}");
+                let mut config = ModelConfig::new(model);
+                config.reasoning = Some(false);
+                assert!(!config.is_reasoning_model());
+            }
+            for model in ["kimi-k30", "kimi-k2.5", "kimi-k2-thinking", "notkimi-k3"] {
+                assert!(
+                    !ModelConfig::new(model).is_kimi_k3_reasoning_model(),
+                    "{model}"
+                );
+            }
         }
 
         #[test]

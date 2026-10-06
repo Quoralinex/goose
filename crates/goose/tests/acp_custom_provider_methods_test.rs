@@ -260,7 +260,8 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 },
                 "requiresAuth": true,
                 "catalogProviderId": "openai",
-                "basePath": "v1/chat/completions"
+                "basePath": "v1/chat/completions",
+                "toolshim": true
             }),
         )
         .await
@@ -299,12 +300,30 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
             custom_provider_path.exists(),
             "custom provider should be saved in Goose's declarative provider store"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&custom_provider_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(
+                &custom_provider_path,
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
         let saved_provider: DeclarativeProviderConfig =
             serde_json::from_str(&std::fs::read_to_string(&custom_provider_path).unwrap())
                 .expect("saved provider should be core-compatible declarative config");
         assert_eq!(saved_provider.name, provider_id);
         assert_eq!(saved_provider.display_name, "Stark ACP Provider");
         assert_eq!(saved_provider.base_url, "https://stark.example/v1");
+        assert!(saved_provider.toolshim);
         assert!(saved_provider.preserves_thinking);
         assert_eq!(
             saved_provider
@@ -350,6 +369,7 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "requiresAuth": true,
                 "catalogProviderId": "openai",
                 "basePath": "v1/chat/completions",
+                "toolshim": true,
                 "apiKeyEnv": "CUSTOM_STARK_ACP_PROVIDER_API_KEY",
                 "apiKeySet": true,
                 "preservesThinking": true,
@@ -386,11 +406,24 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "headers": {},
                 "requiresAuth": true,
                 "catalogProviderId": "zai",
+                "toolshim": true,
                 "preservesThinking": false
             }),
         )
         .await
         .expect("custom provider update should succeed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&custom_provider_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             updated.get("status"),
             Some(&serde_json::json!({
@@ -417,6 +450,7 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
         );
         assert_eq!(updated_provider.base_path, None);
         assert_eq!(updated_provider.headers, None);
+        assert!(updated_provider.toolshim);
         assert!(!updated_provider.preserves_thinking);
         assert_eq!(
             updated_provider
@@ -440,7 +474,8 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "supportsStreaming": false,
                 "headers": {},
                 "requiresAuth": false,
-                "catalogProviderId": "zai"
+                "catalogProviderId": "zai",
+                "toolshim": false
             }),
         )
         .await
@@ -458,6 +493,7 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 .expect("no-auth provider should remain core-compatible");
         assert!(!no_auth_provider.requires_auth);
         assert_eq!(no_auth_provider.api_key_env, "");
+        assert!(!no_auth_provider.toolshim);
         assert!(!no_auth_provider.preserves_thinking);
         assert!(
             matches!(
@@ -480,7 +516,8 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "supportsStreaming": false,
                 "headers": {},
                 "requiresAuth": true,
-                "catalogProviderId": "zai"
+                "catalogProviderId": "zai",
+                "toolshim": false
             }),
         )
         .await
@@ -600,7 +637,8 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "apiKey": "secret",
                 "models": ["model-a"],
                 "headers": {},
-                "requiresAuth": true
+                "requiresAuth": true,
+                "toolshim": false
             });
             let payload_obj = payload.as_object_mut().unwrap();
             for (key, value) in patch.as_object().unwrap() {
@@ -630,7 +668,8 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "apiKey": "owned-secret",
                 "models": ["model-a"],
                 "headers": {},
-                "requiresAuth": true
+                "requiresAuth": true,
+                "toolshim": false
             }),
         )
         .await
@@ -663,7 +702,8 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "apiUrl": "https://api.example.test/v1",
                 "models": ["model-a"],
                 "headers": {},
-                "requiresAuth": false
+                "requiresAuth": false,
+                "toolshim": false
             }),
         )
         .await
@@ -685,7 +725,8 @@ fn acp_catalog_and_custom_provider_methods_use_core_provider_store() {
                 "apiKey": "owned-secret",
                 "models": ["model-a"],
                 "headers": {},
-                "requiresAuth": true
+                "requiresAuth": true,
+                "toolshim": false
             }),
         )
         .await

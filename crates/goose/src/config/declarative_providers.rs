@@ -7,6 +7,7 @@ use crate::providers::huggingface_auth;
 use crate::providers::inventory::declarative_inventory_identity;
 use crate::providers::ollama_def::OllamaProviderDef;
 use crate::providers::openai_def::OpenAiProviderDef;
+use crate::providers::private_file::write_private_file;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,13 @@ pub(crate) fn custom_provider_file_path(id: &str) -> Result<PathBuf> {
     Ok(custom_providers_dir().join(format!("{}.json", id)))
 }
 
+fn persist_custom_provider(provider: &DeclarativeProviderConfig) -> Result<()> {
+    let json_content = serde_json::to_string_pretty(provider)?;
+    let file_path = custom_provider_file_path(&provider.name)?;
+    write_private_file(&file_path, &json_content)?;
+    Ok(())
+}
+
 pub fn generate_api_key_name(id: &str) -> String {
     format!("{}_API_KEY", id.to_uppercase())
 }
@@ -144,6 +152,7 @@ pub struct CreateCustomProviderParams {
     pub requires_auth: bool,
     pub catalog_provider_id: Option<String>,
     pub base_path: Option<String>,
+    pub toolshim: bool,
     pub preserves_thinking: Option<bool>,
     /// Alternative to `api_key`; mutually exclusive with it.
     pub auth: Option<AuthConfig>,
@@ -162,6 +171,7 @@ pub struct UpdateCustomProviderParams {
     pub requires_auth: bool,
     pub catalog_provider_id: Option<String>,
     pub base_path: Option<String>,
+    pub toolshim: bool,
     pub preserves_thinking: Option<bool>,
     /// Alternative to `api_key`; mutually exclusive with it.
     pub auth: Option<AuthConfig>,
@@ -214,6 +224,7 @@ pub fn create_custom_provider(
         base_url: params.api_url,
         models: model_infos,
         headers: params.headers,
+        session_id_header_override: None,
         timeout_seconds: None,
         supports_streaming: params.supports_streaming,
         requires_auth: params.requires_auth,
@@ -225,17 +236,13 @@ pub fn create_custom_provider(
         skip_canonical_filtering: false,
         model_doc_link: None,
         setup_steps: vec![],
+        toolshim: params.toolshim,
         preserves_thinking,
         emit_clear_thinking: false,
         setup: None,
     };
 
-    let custom_providers_dir = custom_providers_dir();
-    std::fs::create_dir_all(&custom_providers_dir)?;
-
-    let json_content = serde_json::to_string_pretty(&provider_config)?;
-    let file_path = custom_providers_dir.join(format!("{}.json", id));
-    std::fs::write(file_path, json_content)?;
+    persist_custom_provider(&provider_config)?;
 
     Ok(provider_config)
 }
@@ -332,6 +339,7 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
                 Some(h) => Some(h),
                 None => existing_config.headers,
             },
+            session_id_header_override: existing_config.session_id_header_override,
             timeout_seconds: existing_config.timeout_seconds,
             supports_streaming: params.supports_streaming,
             requires_auth: params.requires_auth,
@@ -343,14 +351,13 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
             skip_canonical_filtering: existing_config.skip_canonical_filtering,
             model_doc_link: existing_config.model_doc_link,
             setup_steps: existing_config.setup_steps,
+            toolshim: params.toolshim,
             preserves_thinking,
             emit_clear_thinking: existing_config.emit_clear_thinking,
             setup: existing_config.setup,
         };
 
-        let file_path = custom_provider_file_path(&updated_config.name)?;
-        let json_content = serde_json::to_string_pretty(&updated_config)?;
-        std::fs::write(file_path, json_content)?;
+        persist_custom_provider(&updated_config)?;
     }
     Ok(())
 }
@@ -608,6 +615,7 @@ mod tests {
                 request_params: None,
             }],
             headers: None,
+            session_id_header_override: None,
             timeout_seconds: None,
             supports_streaming: Some(true),
             requires_auth: true,
@@ -619,10 +627,47 @@ mod tests {
             skip_canonical_filtering: false,
             model_doc_link: None,
             setup_steps: Vec::new(),
+            toolshim: false,
             preserves_thinking: true,
             emit_clear_thinking: false,
             setup: None,
         }
+    }
+
+    #[test]
+    fn toolshim_changes_declarative_inventory_identity() {
+        let _guard = env_lock::lock_env([("GOOSE_TOOLSHIM", None::<&str>)]);
+        let mut config = test_huggingface_config();
+
+        let native = declarative_inventory_identity(&config)
+            .unwrap()
+            .into_identity()
+            .unwrap();
+        config.toolshim = true;
+        let toolshim = declarative_inventory_identity(&config)
+            .unwrap()
+            .into_identity()
+            .unwrap();
+
+        assert_ne!(native.inventory_key, toolshim.inventory_key);
+    }
+
+    #[test]
+    fn session_id_header_override_changes_declarative_inventory_identity() {
+        let _guard = env_lock::lock_env([("GOOSE_TOOLSHIM", None::<&str>)]);
+        let mut config = test_huggingface_config();
+
+        let default = declarative_inventory_identity(&config)
+            .unwrap()
+            .into_identity()
+            .unwrap();
+        config.session_id_header_override = Some("x-custom-session".to_string());
+        let overridden = declarative_inventory_identity(&config)
+            .unwrap()
+            .into_identity()
+            .unwrap();
+
+        assert_ne!(default.inventory_key, overridden.inventory_key);
     }
 
     #[test]
@@ -770,6 +815,7 @@ mod tests {
             requires_auth: false,
             catalog_provider_id: None,
             base_path: None,
+            toolshim: false,
             preserves_thinking: None,
             auth: None,
         })
@@ -787,6 +833,7 @@ mod tests {
             requires_auth: false,
             catalog_provider_id: None,
             base_path: None,
+            toolshim: false,
             preserves_thinking: None,
             auth: None,
         })
@@ -904,6 +951,7 @@ mod tests {
             requires_auth: false,
             catalog_provider_id: None,
             base_path: None,
+            toolshim: false,
             preserves_thinking: None,
             auth: None,
         })

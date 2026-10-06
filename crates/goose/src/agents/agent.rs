@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use futures::stream::BoxStream;
 use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+use goose_agent::inference::ends_with_successful_tool_response;
 use tracing_futures::Instrument;
 
 use super::container::Container;
@@ -17,31 +18,31 @@ use super::tool_confirmation_coordinator::{
 };
 use super::tool_confirmation_router::ToolConfirmationRouter;
 use super::tool_execution::{
-    tool_stream, ToolCallResult, ToolStream, ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE,
-    DECLINED_RESPONSE,
+    tool_stream, ApprovalToolContext, ToolCallResult, ToolStream, ToolStreamItem,
+    CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
 };
 use crate::action_required_manager::ElicitationOutcome;
-use crate::agents::extension::{ExtensionConfig, ExtensionResult, ToolInfo};
+use crate::agents::extension::{ExtensionConfig, ExtensionResult};
 use crate::agents::extension_manager::{
-    get_parameter_names, ExtensionManager, ExtensionManagerCapabilities,
+    CallRequest, ExtensionLease, ExtensionManager, ExtensionManagerCapabilities,
 };
 use crate::agents::final_output_tool::{
     structured_output_unsupported_message, FINAL_OUTPUT_CONTINUATION_MESSAGE,
     FINAL_OUTPUT_TOOL_NAME,
 };
-use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
-    persist_tool_confirmation_decision, run_goose, BangShellOperation, CompactionOperation,
-    DoctorOperation, Emitter, EntryHookOperation, ExitOnErrorOperation, GooseEffect,
-    GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation,
-    Operation, ProjectOperation, RecipeOperation, RetryOperation, SkillOperation,
-    SlashCommandOperation, StateMachine, StatusOperation, SteerOperation, SteerQueue, Step,
-    StopHookOperation, ToolApprovalOperation, ToolExecutionOperation, ToolPairCompactionOperation,
-    UnknownToolOperation, MAX_TURNS_MESSAGE,
+    persist_tool_confirmation_decision, run_goose, subagent_cancelled_message, BangShellOperation,
+    CompactionOperation, DoctorOperation, Emitter, EntryHookOperation, ExitOnErrorOperation,
+    ForegroundSubagentOperation, GooseEffect, GooseInferenceProvider,
+    GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation, Operation, ProjectOperation,
+    RecipeOperation, RetryOperation, SkillOperation, SlashCommandOperation, StateMachine,
+    StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
+    ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
+use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::types::{
     SessionConfig, SharedProvider, DEFAULT_ON_FAILURE_TIMEOUT_SECONDS,
     DEFAULT_RETRY_TIMEOUT_SECONDS,
@@ -49,7 +50,7 @@ use crate::agents::types::{
 use crate::agents::AgentEvent;
 use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
-use crate::config::{get_enabled_extensions, Config, GooseMode};
+use crate::config::{Config, GooseMode};
 use crate::context_mgmt::{
     check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
 };
@@ -57,14 +58,12 @@ use crate::conversation::message::{
     ActionRequiredData, InferenceMetadata, Message, MessageContent, MessageUsage, ProviderMetadata,
     SystemNotificationType,
 };
-use crate::conversation::{
-    debug_conversation_fix, fix_conversation, merge_consecutive_messages_for_request, Conversation,
-};
+use crate::conversation::{debug_conversation_fix, fix_conversation, Conversation};
 use crate::permission::permission_inspector::PermissionInspector;
 use crate::permission::permission_judge::PermissionCheckResult;
 use crate::permission::{Permission, PermissionConfirmation};
 use crate::providers::base::{PermissionRouting, Provider};
-use crate::recipe::{Author, Recipe, Response, Settings};
+use crate::recipe::Response;
 use crate::scheduler_trait::SchedulerTrait;
 use crate::security::adversary_inspector::AdversaryInspector;
 use crate::security::egress_inspector::EgressInspector;
@@ -77,10 +76,9 @@ use crate::utils::is_token_cancelled;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
 use goose_providers::thinking::{ThinkingEffort, ThinkingEffortSupport};
-use regex::Regex;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ElicitationAction, ErrorCode, ErrorData,
-    GetPromptResult, Prompt, ProtocolVersion, Tool,
+    GetPromptResult, Prompt, Tool,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
@@ -98,8 +96,6 @@ fn provider_creation_error(error: anyhow::Error, context: impl fmt::Display) -> 
     let message = format!("{context}: {error}");
     error.context(message)
 }
-
-pub const MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 fn normalize_legacy_provider_thinking_effort(
     mut model_config: goose_providers::model::ModelConfig,
@@ -183,6 +179,8 @@ pub(crate) fn stop_hook_block_cap_warning(plugin: &str, cap: u32) -> Message {
 
 /// Context needed for the reply function
 pub struct ReplyContext {
+    session: Session,
+    lease: Arc<ExtensionLease>,
     pub conversation: Conversation,
     pub tools: Vec<Tool>,
     pub toolshim_tools: Vec<Tool>,
@@ -341,16 +339,35 @@ async fn persist_and_push_message_with_id(
     Ok(message)
 }
 
+async fn persist_turn_context_if_changed(
+    session_manager: &SessionManager,
+    session_id: &str,
+    conversation: &mut Conversation,
+    turn_context: Option<Message>,
+) -> Result<()> {
+    let Some(turn_context) = turn_context else {
+        return Ok(());
+    };
+    if conversation
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.is_turn_context())
+        .is_some_and(|current| current.as_concat_text() == turn_context.as_concat_text())
+    {
+        return Ok(());
+    }
+    persist_and_push_message_with_id(session_manager, session_id, conversation, turn_context)
+        .await?;
+    Ok(())
+}
+
 fn project_message_for_user_event(message: &Message) -> Message {
     message.user_visible_content()
 }
 
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
-}
-
-fn user_visible_message_text(message: &Message) -> String {
-    message.user_visible_content().as_concat_text()
 }
 
 fn attach_turn_usage(
@@ -485,6 +502,13 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn set_hook_manager_for_test(&mut self, hook_manager: crate::hooks::HookManager) {
         self.hook_manager = hook_manager;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_extension_lease_for_test(&self, session_id: &str) {
+        self.tool_confirmation_coordinator
+            .session(session_id)
+            .clear_extension_lease();
     }
 
     #[cfg(test)]
@@ -854,9 +878,8 @@ impl Agent {
 
     async fn prepare_reply_context(
         &self,
-        session_id: &str,
+        session: &Session,
         unfixed_conversation: Conversation,
-        working_dir: &std::path::Path,
     ) -> Result<ReplyContext> {
         let unfixed_messages = unfixed_conversation.messages().clone();
         let (conversation, issues) = fix_conversation(unfixed_conversation.clone());
@@ -870,9 +893,8 @@ impl Agent {
                 )
             );
         }
-        let (tools, toolshim_tools, system_prompt, model_config) = self
-            .prepare_tools_and_prompt(session_id, working_dir)
-            .await?;
+        let (session, lease, tools, toolshim_tools, system_prompt, model_config) =
+            self.prepare_tools_and_prompt(session).await?;
 
         let goose_mode = *self.current_goose_mode.lock().await;
 
@@ -897,6 +919,8 @@ impl Agent {
         };
 
         Ok(ReplyContext {
+            session,
+            lease,
             conversation,
             tools,
             toolshim_tools,
@@ -909,6 +933,7 @@ impl Agent {
 
     async fn handle_approved_and_denied_tools(
         &self,
+        lease: &ExtensionLease,
         permission_check_result: &PermissionCheckResult,
         request_to_response_map: &mut HashMap<String, Message>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
@@ -920,7 +945,8 @@ impl Agent {
         for request in &permission_check_result.approved {
             if let Ok(tool_call) = request.tool_call.clone() {
                 let (req_id, tool_result) = self
-                    .dispatch_tool_call(
+                    .dispatch_tool_call_on(
+                        lease,
                         tool_call,
                         request.id.clone(),
                         cancel_token.clone(),
@@ -1011,6 +1037,20 @@ impl Agent {
             .map_err(|e| anyhow!("Could not resolve model config: {e}"))
     }
 
+    pub(super) async fn effective_model_config_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<goose_providers::model::ModelConfig> {
+        let model_config = self.model_config_for_session(session_id).await?;
+        let provider_name = self.provider().await?.get_name().to_string();
+        match crate::providers::get_from_registry(&provider_name).await {
+            Ok(entry) => Ok(entry
+                .normalize_model_config(model_config.clone())
+                .unwrap_or(model_config)),
+            Err(_) => Ok(model_config),
+        }
+    }
+
     /// When set, all stdio extensions will be started via `docker exec` in the specified container.
     pub async fn set_container(&self, container: Option<Container>) {
         *self.container.lock().await = container.clone();
@@ -1044,9 +1084,21 @@ impl Agent {
         Ok(())
     }
 
-    /// Dispatch a single tool call to the appropriate client
+    pub async fn dispatch_tool_call(
+        &self,
+        tool_call: CallToolRequestParams,
+        request_id: String,
+        cancellation_token: Option<CancellationToken>,
+        session: &Session,
+    ) -> (String, Result<ToolCallResult, ErrorData>) {
+        let lease = self.resolve_lease(&session.id, &session.working_dir).await;
+        self.dispatch_tool_call_on(&lease, tool_call, request_id, cancellation_token, session)
+            .await
+    }
+
     #[instrument(
-        skip(self, tool_call, request_id, cancellation_token, session),
+        name = "dispatch_tool_call",
+        skip(self, lease, tool_call, request_id, cancellation_token, session),
         fields(
             input,
             output,
@@ -1060,8 +1112,9 @@ impl Agent {
             error.type = tracing::field::Empty,
         )
     )]
-    pub async fn dispatch_tool_call(
+    pub(super) async fn dispatch_tool_call_on(
         &self,
+        lease: &ExtensionLease,
         tool_call: CallToolRequestParams,
         request_id: String,
         cancellation_token: Option<CancellationToken>,
@@ -1155,18 +1208,12 @@ impl Agent {
             };
         }
 
-        let ctx = super::tool_execution::ToolCallContext::new(
-            session.id.clone(),
-            Some(session.working_dir.clone()),
-            Some(request_id.clone()),
-        );
-
         debug!("WAITING_TOOL_START: {}", tool_call.name);
-        let result = self
-            .extension_manager
-            .dispatch_tool_call(
-                &ctx,
+        let container = self.container.lock().await.clone();
+        let result = lease
+            .call(
                 tool_call.clone(),
+                CallRequest::new(request_id.clone()).with_container(container.clone()),
                 cancellation_token.unwrap_or_default(),
             )
             .await;
@@ -1178,6 +1225,9 @@ impl Agent {
             );
             ToolCallResult::from(Err(error_data))
         });
+        let result = self
+            .extension_manager
+            .applying_mutation(result, container, &session.id);
 
         debug!("WAITING_TOOL_END: {}", tool_call.name);
 
@@ -1185,27 +1235,8 @@ impl Agent {
         (request_id, Ok(result))
     }
 
-    /// Save current extension state to session metadata
-    /// Should be called after any extension add/remove operation
     pub async fn save_extension_state(&self, session: &SessionConfig) -> Result<()> {
-        let extensions_state =
-            EnabledExtensionsState::new(self.extension_manager.get_extension_configs().await);
-
-        let session_manager = self.config.session_manager.clone();
-        let mut session_data = session_manager.get_session(&session.id, false).await?;
-
-        if let Err(e) = extensions_state.to_extension_data(&mut session_data.extension_data) {
-            warn!("Failed to serialize extension state: {}", e);
-            return Err(anyhow!("Extension state serialization failed: {}", e));
-        }
-
-        session_manager
-            .update(&session.id)
-            .extension_data(session_data.extension_data)
-            .apply()
-            .await?;
-
-        Ok(())
+        self.persist_extension_state(&session.id).await
     }
 
     /// Save current extension state to session by session_id
@@ -1424,7 +1455,7 @@ impl Agent {
         Ok(results)
     }
 
-    async fn add_extension_inner(
+    pub(super) async fn add_extension_inner(
         &self,
         extension: ExtensionConfig,
         session_id: &str,
@@ -1450,13 +1481,36 @@ impl Agent {
         Ok(())
     }
 
+    pub(crate) async fn update_extension_working_dir(
+        &self,
+        session_id: &str,
+        working_dir: &std::path::Path,
+    ) -> ExtensionResult<()> {
+        let container = self.container.lock().await;
+        self.extension_manager
+            .update_working_dir(working_dir, container.as_ref(), session_id)
+            .await
+    }
+
+    pub(crate) async fn resolve_lease(
+        &self,
+        session_id: &str,
+        working_dir: &std::path::Path,
+    ) -> Arc<ExtensionLease> {
+        Arc::new(
+            self.extension_manager
+                .current_lease(session_id, Some(working_dir))
+                .await,
+        )
+    }
+
     pub async fn list_tools(&self, session_id: &str, extension_name: Option<String>) -> Vec<Tool> {
         let include_final_output = extension_name.is_none();
-        let mut prefixed_tools = self
-            .extension_manager
-            .get_prefixed_tools(session_id, extension_name)
-            .await
-            .unwrap_or_default();
+        let lease = self.extension_manager.current_lease(session_id, None).await;
+        let mut prefixed_tools = match extension_name {
+            Some(name) => lease.tools_for(&name).await,
+            None => lease.tools().await,
+        };
 
         if include_final_output {
             if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
@@ -1609,6 +1663,27 @@ impl Agent {
         false
     }
 
+    pub async fn handle_confirmation(
+        &self,
+        session_id: &str,
+        request_id: String,
+        confirmation: PermissionConfirmation,
+    ) {
+        if self
+            .try_route_tool_confirmation_to_provider(&request_id, &confirmation)
+            .await
+        {
+            return;
+        }
+        if !self
+            .tool_confirmation_router
+            .deliver(session_id, &request_id, confirmation)
+            .await
+        {
+            error!("Failed to deliver confirmation");
+        }
+    }
+
     pub async fn supports_action_required_permissions(&self) -> bool {
         if let Some(provider) = self.provider.lock().await.as_ref() {
             return provider.permission_routing() == PermissionRouting::ActionRequired;
@@ -1616,20 +1691,25 @@ impl Agent {
         false
     }
 
-    pub(super) fn create_state_machine(
+    pub(super) async fn create_state_machine(
         &self,
         provider: Arc<dyn Provider>,
         model_config: goose_providers::model::ModelConfig,
         context_limit: usize,
-        max_turns: Option<u32>,
+        session_config: SessionConfig,
         cancel: CancellationToken,
         steer_queue: SteerQueue,
     ) -> StateMachine<'_, Session, GooseEffect> {
-        let max_turns = max_turns.unwrap_or_else(|| {
+        let container = self.container.lock().await.clone();
+        let max_turns = session_config.max_turns.unwrap_or_else(|| {
             Config::global()
                 .get_param::<u32>("GOOSE_MAX_TURNS")
                 .unwrap_or(DEFAULT_MAX_TURNS)
         });
+        let extension_lease = self
+            .tool_confirmation_coordinator
+            .session(&session_config.id)
+            .extension_lease();
         let retry_timeout = Config::global()
             .get_param::<u64>("GOOSE_RECIPE_RETRY_TIMEOUT_SECONDS")
             .unwrap_or(DEFAULT_RETRY_TIMEOUT_SECONDS);
@@ -1684,7 +1764,20 @@ impl Agent {
             )),
             Arc::new(DoctorOperation),
             Arc::new(ProjectOperation),
-            Arc::new(SkillOperation::new(self.hook_manager.clone())),
+            Arc::new(SkillOperation::new(
+                self.hook_manager.clone(),
+                Arc::clone(&extension_lease),
+            )),
+            // Before RecipeOperation: a `delegate` response only means the subagent
+            // started, so a final output from the same batch must not be shown until
+            // the subagents have run.
+            Arc::new(ForegroundSubagentOperation::new(
+                ForegroundSubagentRunner::new(
+                    self.config.session_manager.clone(),
+                    self.config.resolve_use_login_shell_path(),
+                ),
+                cancel.clone(),
+            )),
             Arc::new(RecipeOperation::new(
                 provider.clone(),
                 self.hook_manager.clone(),
@@ -1693,6 +1786,8 @@ impl Agent {
                 &self.current_goose_mode,
                 self.extension_manager.clone(),
                 self.hook_manager.clone(),
+                container,
+                Arc::clone(&extension_lease),
             )),
             Arc::new(UnknownToolOperation::new(self.hook_manager.clone())),
             Arc::new(RetryOperation::new(
@@ -1709,8 +1804,8 @@ impl Agent {
         ];
         operations.extend(remaining_operations);
         let request_preparer = GooseInferenceRequestPreparer {
-            #[cfg(feature = "code-mode")]
-            extension_manager: self.extension_manager.clone(),
+            extension_manager: Arc::clone(&self.extension_manager),
+            extension_lease,
             goose_mode: &self.current_goose_mode,
             prompt_manager: &self.prompt_manager,
             tool_inspection_manager: &self.tool_inspection_manager,
@@ -1749,12 +1844,31 @@ impl Agent {
         session_config: SessionConfig,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
+        let session_id = session_config.id.clone();
+        let events = crate::session_context::with_session_id(
+            Some(session_id.clone()),
+            self.reply_with_state_machine_inner(user_message, session_config, cancel_token),
+        )
+        .await?;
+        Ok(crate::session_context::with_session_id_stream(
+            Some(session_id),
+            events,
+        ))
+    }
+
+    async fn reply_with_state_machine_inner(
+        &self,
+        user_message: Message,
+        session_config: SessionConfig,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
         let session_manager = self.config.session_manager.clone();
         let session_id = session_config.id.clone();
         let turn_guard = self
             .tool_confirmation_coordinator
             .session(&session_id)
             .try_start_turn()?;
+        turn_guard.state().start_new_turn();
 
         if let Some(schedule_id) = session_config.schedule_id.clone() {
             session_manager
@@ -1812,6 +1926,44 @@ impl Agent {
         session_config: SessionConfig,
         cancel: CancellationToken,
     ) -> Result<Option<BoxStream<'static, Result<AgentEvent>>>> {
+        let session_id = session_config.id.clone();
+        let stream = crate::session_context::with_session_id(
+            Some(session_id.clone()),
+            self.resume_state_machine_turn_inner(session_config, cancel),
+        )
+        .await?;
+        Ok(stream
+            .map(|stream| crate::session_context::with_session_id_stream(Some(session_id), stream)))
+    }
+
+    pub async fn cancel_foreground_subagents(&self, session_id: &str) {
+        if let Err(error) = self.record_cancelled_subagents(session_id).await {
+            error!(
+                session_id,
+                ?error,
+                "Failed to record cancelled foreground subagents"
+            );
+        }
+    }
+
+    async fn record_cancelled_subagents(&self, session_id: &str) -> Result<()> {
+        let session_manager = &self.config.session_manager;
+        let session = session_manager.get_session(session_id, true).await?;
+        let Some(message) = session
+            .conversation
+            .as_ref()
+            .and_then(|conversation| subagent_cancelled_message(conversation.messages()))
+        else {
+            return Ok(());
+        };
+        session_manager.add_message(session_id, &message).await
+    }
+
+    async fn resume_state_machine_turn_inner(
+        self: &Arc<Self>,
+        session_config: SessionConfig,
+        cancel: CancellationToken,
+    ) -> Result<Option<BoxStream<'static, Result<AgentEvent>>>> {
         if !super::state_machine::enabled() {
             return Ok(None);
         }
@@ -1841,7 +1993,7 @@ impl Agent {
         }
 
         let agent = Arc::clone(self);
-        Ok(Some(Box::pin(async_stream::try_stream! {
+        let stream = Box::pin(async_stream::try_stream! {
             let initial_stream = if resume_from_persisted_response {
                 Some(
                     agent
@@ -1863,7 +2015,8 @@ impl Agent {
             while let Some(event) = stream.next().await {
                 yield event?;
             }
-        })))
+        });
+        Ok(Some(stream))
     }
 
     fn tool_confirmation_request_ids(event: &AgentEvent) -> Vec<String> {
@@ -1908,6 +2061,7 @@ impl Agent {
                     }
 
                     if !has_confirmations {
+                        turn_guard.state().clear_confirmations();
                         return;
                     }
                 }
@@ -1917,9 +2071,9 @@ impl Agent {
                     .wait_for_all_confirmation_answers(&cancel)
                     .await?;
                 if !has_state_machine_answer {
+                    turn_guard.state().clear_confirmations();
                     return;
                 }
-                turn_guard.state().clear_confirmations();
                 stream = Some(
                     self.stream_state_machine_session(
                         session_config.clone(),
@@ -1931,46 +2085,35 @@ impl Agent {
         })
     }
 
-    async fn stream_state_machine_session(
+    pub(super) async fn stream_state_machine_session(
         &self,
         session_config: SessionConfig,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
         let session_manager = self.config.session_manager.clone();
         let session_id = session_config.id.clone();
-        let entry_session = session_manager.get_session(&session_id, false).await?;
         let provider = self
             .provider
             .lock()
             .await
             .clone()
             .ok_or_else(|| anyhow!("Provider not set"))?;
-        let model_config = match entry_session.model_config {
-            Some(model_config) => model_config,
-            None => {
-                let provider_name = Config::global()
-                    .get_goose_provider()
-                    .map_err(|_| anyhow!("Could not resolve model config: missing provider"))?;
-                let model_name = Config::global()
-                    .get_goose_model()
-                    .map_err(|_| anyhow!("Could not resolve model config: missing model"))?;
-                crate::model_config::model_config_from_user_config(&provider_name, &model_name)
-                    .map_err(|error| anyhow!("Could not resolve model config: {error}"))?
-            }
-        };
+        let model_config = self.effective_model_config_for_session(&session_id).await?;
 
         let context_limit =
             crate::context_limit::get_context_limit(provider.as_ref(), &model_config.model_name)
                 .await?;
         let steer_queue = self.steer_queue(&session_id).await;
-        let machine = self.create_state_machine(
-            provider,
-            model_config,
-            context_limit,
-            session_config.max_turns,
-            cancel.clone(),
-            steer_queue,
-        );
+        let machine = self
+            .create_state_machine(
+                provider,
+                model_config,
+                context_limit,
+                session_config,
+                cancel.clone(),
+                steer_queue,
+            )
+            .await;
         let reply_span = tracing::Span::current();
 
         Ok(Box::pin(
@@ -2002,8 +2145,21 @@ impl Agent {
         ))
     }
 
+    pub(crate) async fn reply_live_delegation(
+        &self,
+        user_message: Message,
+        session_config: SessionConfig,
+        cancel_token: CancellationToken,
+    ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
+        let user_message = user_message.agent_only();
+        let events = self
+            .reply_with_state_machine(user_message, session_config, Some(cancel_token))
+            .await?;
+        Ok(Box::pin(events.map_ok(ensure_message_event_id)))
+    }
+
     #[instrument(
-        skip(self, user_message, session_config, cancel_token),
+        skip(self, user_message, session_config, use_state_machine, cancel_token),
         fields(
             user_message,
             trace_input,
@@ -2021,12 +2177,22 @@ impl Agent {
         &self,
         user_message: Message,
         session_config: SessionConfig,
+        use_state_machine: bool,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
         let reply_span = tracing::Span::current();
-        let events = self
-            .reply_impl(user_message, session_config, cancel_token)
-            .await?;
+        let session_id = session_config.id.clone();
+        let events = crate::session_context::with_session_id(
+            Some(session_id.clone()),
+            self.reply_impl(
+                user_message,
+                session_config,
+                use_state_machine,
+                cancel_token,
+            ),
+        )
+        .await?;
+        let events = crate::session_context::with_session_id_stream(Some(session_id), events);
 
         // This is the single live-event identity boundary. Callers that intentionally stream
         // multiple events for one logical message must assign their shared ID before this point.
@@ -2041,6 +2207,7 @@ impl Agent {
         &self,
         user_message: Message,
         session_config: SessionConfig,
+        use_state_machine: bool,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
         let user_message = user_message.with_generated_id_if_missing();
@@ -2093,10 +2260,7 @@ impl Agent {
             }
         }
 
-        if super::state_machine::enabled()
-            || super::state_machine::bang_shell_command(&user_visible_message_text(&user_message))
-                .is_some()
-        {
+        if use_state_machine {
             tracing::info!("dispatching reply via experimental state machine");
             return self
                 .reply_with_state_machine(user_message, session_config, cancel_token)
@@ -2393,10 +2557,10 @@ impl Agent {
         cancel_token: Option<CancellationToken>,
         reply_span: tracing::Span,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
-        let context = self
-            .prepare_reply_context(&session.id, conversation, session.working_dir.as_path())
-            .await?;
+        let context = self.prepare_reply_context(&session, conversation).await?;
         let ReplyContext {
+            session,
+            lease: mut inference_lease,
             mut conversation,
             mut tools,
             mut toolshim_tools,
@@ -2406,7 +2570,8 @@ impl Agent {
             model_config,
         } = context;
 
-        if let Some(project_addendum) = self.load_project_instructions(&session).await {
+        let project_addendum = self.load_project_instructions(&session).await;
+        if let Some(project_addendum) = &project_addendum {
             system_prompt = format!("{system_prompt}\n\n{project_addendum}");
         }
 
@@ -2472,7 +2637,6 @@ impl Agent {
             .filter(|c| matches!(c, MessageContent::ToolRequest(_)))
             .count();
 
-        let working_dir = session.working_dir.clone();
         let reply_stream_span = tracing::info_span!(
             parent: &reply_span,
             "reply_stream",
@@ -2511,6 +2675,7 @@ impl Agent {
             }
         }
         let inner = Box::pin(async_stream::try_stream! {
+            let mut session = session;
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
                 Config::global()
@@ -2534,30 +2699,63 @@ impl Agent {
                 super::moim::compute_compaction_info(&session_config.id, &self.extension_manager)
                     .await;
 
-            if let Some(turn_context) = super::moim::turn_context_message(
+            persist_turn_context_if_changed(
+                &session_manager,
                 &session_config.id,
-                &self.extension_manager,
-                turns_taken,
-                max_turns,
-                turn_start,
-                turn_start_compaction_info,
-            )
-            .await
-            {
-                persist_and_push_message_with_id(
-                    &session_manager,
+                &mut conversation,
+                super::moim::turn_context_message(
                     &session_config.id,
-                    &mut conversation,
-                    turn_context,
+                    &self.extension_manager,
+                    &inference_lease,
+                    turns_taken,
+                    max_turns,
+                    turn_start,
+                    turn_start_compaction_info.clone(),
                 )
-                .await?;
-            }
+                .await,
+            )
+            .await?;
             // Snapshot after the turn-context append so a retry keeps the sent prefix.
             let initial_messages = conversation.messages().clone();
 
+            let mut first_inference = true;
             loop {
                 if is_token_cancelled(&cancel_token) {
                     break;
+                }
+
+                // Rebuilt before every provider call, same as the state
+                // machine, so the lease dispatch resolves against is the
+                // one this inference was shown.
+                if first_inference {
+                    first_inference = false;
+                } else {
+                    let fallback_session = session_manager
+                        .get_session(&session_config.id, false)
+                        .await?;
+                    (session, inference_lease, tools, toolshim_tools, system_prompt, _) = self
+                        .prepare_tools_and_prompt(&fallback_session)
+                        .await?;
+                    let project_addendum = self.load_project_instructions(&session).await;
+                    if let Some(project_addendum) = &project_addendum {
+                        system_prompt = format!("{system_prompt}\n\n{project_addendum}");
+                    }
+                    persist_turn_context_if_changed(
+                        &session_manager,
+                        &session_config.id,
+                        &mut conversation,
+                        super::moim::turn_context_message(
+                            &session_config.id,
+                            &self.extension_manager,
+                            &inference_lease,
+                            turns_taken,
+                            max_turns,
+                            turn_start,
+                            turn_start_compaction_info.clone(),
+                        )
+                        .await,
+                    )
+                    .await?;
                 }
 
                 if can_drain_pending_steers {
@@ -2680,7 +2878,6 @@ impl Agent {
 
                 let mut no_tools_called = true;
                 let mut messages_to_add = Conversation::default();
-                let mut tools_updated = false;
                 let mut did_recovery_compact_this_iteration = false;
                 let mut exit_chat = false;
                 let mut provider_errored = false;
@@ -2857,17 +3054,8 @@ impl Agent {
                                             result
                                         });
 
-                                    // Track extension requests
-                                    let mut enable_extension_request_ids = vec![];
-                                    for request in &tool_requests {
-                                        if let Ok(tool_call) = &request.tool_call {
-                                            if tool_call.name == MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE {
-                                                enable_extension_request_ids.push(request.id.clone());
-                                            }
-                                        }
-                                    }
-
                                     let mut tool_futures = self.handle_approved_and_denied_tools(
+                                        &inference_lease,
                                         &permission_check_result,
                                         &mut request_to_response_map,
                                         cancel_token.clone(),
@@ -2877,11 +3065,14 @@ impl Agent {
                                     {
                                         let mut tool_approval_stream = self.handle_approval_tool_requests(
                                             &permission_check_result.needs_approval,
-                                            &mut tool_futures,
-                                            &mut request_to_response_map,
-                                            cancel_token.clone(),
-                                            &session,
-                                            &inspection_results,
+                                            ApprovalToolContext {
+                                                lease: &inference_lease,
+                                                tool_futures: &mut tool_futures,
+                                                request_to_response_map: &mut request_to_response_map,
+                                                cancellation_token: cancel_token.clone(),
+                                                session: &session,
+                                                inspection_results: &inspection_results,
+                                            },
                                         );
 
                                         while let Some(msg) = tool_approval_stream.try_next().await? {
@@ -2897,8 +3088,6 @@ impl Agent {
                                         .collect::<Vec<_>>();
 
                                     let mut combined = stream::select_all(with_id);
-                                    let mut all_install_successful = true;
-
                                     loop {
                                         if is_token_cancelled(&cancel_token) {
                                             break;
@@ -2936,11 +3125,6 @@ impl Agent {
                                                                     }
                                                                 }
 
-                                                                if enable_extension_request_ids.contains(&request_id)
-                                                                    && output.is_err()
-                                                                {
-                                                                    all_install_successful = false;
-                                                                }
                                                                 if let Some(response) = request_to_response_map.get_mut(&request_id) {
                                                                     let metadata = request_metadata.get(&request_id).and_then(|m| m.as_ref());
                                                                     response.add_tool_response_with_metadata(request_id, output, metadata);
@@ -2959,146 +3143,54 @@ impl Agent {
                                         }
                                     }
 
-                                    if all_install_successful && !enable_extension_request_ids.is_empty() {
-                                        if let Err(e) = self.save_extension_state(&session_config).await {
-                                            warn!("Failed to save extension state after runtime changes: {}", e);
-                                        }
-                                        tools_updated = true;
-                                    }
                                 }
 
-                                // Thinking/reasoning belongs on the tool-call messages, not also
-                                // as a separate standalone message: Gemini and Kimi/DeepSeek
-                                // require it echoed on each assistant tool-call message, and the
-                                // provider formatters reconstruct per-provider shape from there.
-                                // Storing it both standalone AND on the tool-call message
-                                // duplicates it; once merge_consecutive_messages glues the adjacent
-                                // standalone and tool-call messages together, the duplicate signed
-                                // blocks make Anthropic reject the turn with a 400. So the thinking
-                                // is carried onto the split request messages below and never kept
-                                // as a redundant standalone message.
+                                // DeepSeek and Kimi need the turn's thinking on every split
+                                // tool-call message; fix_conversation removes the signed copies.
+                                let is_thinking = |c: &MessageContent| {
+                                    matches!(
+                                        c,
+                                        MessageContent::Thinking(_)
+                                            | MessageContent::RedactedThinking(_)
+                                    )
+                                };
+                                let prior_thinking: Vec<MessageContent> = messages_to_add
+                                    .iter()
+                                    .filter(|m| m.role == response.role)
+                                    .flat_map(|m| m.content.iter())
+                                    .filter(|c| is_thinking(c))
+                                    .cloned()
+                                    .collect();
                                 let direct_thinking: Vec<MessageContent> = response
                                     .content
                                     .iter()
-                                    .filter(|c| {
-                                        matches!(
-                                            c,
-                                            MessageContent::Thinking(_)
-                                                | MessageContent::RedactedThinking(_)
-                                        )
-                                    })
+                                    .filter(|c| is_thinking(c) && !prior_thinking.contains(c))
                                     .cloned()
                                     .collect();
-                                // When thinking arrived in earlier stream chunks it was stored as
-                                // standalone thinking-only messages; reuse that thinking on the
-                                // tool-call messages and drop the standalone messages so the
-                                // thinking isn't duplicated.
-                                // Always accumulate ALL prior thinking — even when
-                                // direct_thinking is non-empty (reasoning arrived on the same
-                                // chunk as tool_calls) — because otherwise only the last chunk's
-                                // reasoning ends up on split tool-call messages.
-                                // Also extract thinking from mixed (thinking+text) messages,
-                                // not just pure-thinking-only ones.
-                                let mut accumulated_prior: Vec<MessageContent> = Vec::new();
-                                let mut indices_to_remove: Vec<usize> = Vec::new();
-                                for (idx, m) in messages_to_add.messages_mut().iter_mut().enumerate()
-                                {
-                                    if m.role != response.role || m.content.is_empty() {
-                                        continue;
-                                    }
-                                    let thinking_only = m.content.iter().all(|c| {
-                                        matches!(
-                                            c,
-                                            MessageContent::Thinking(_)
-                                                | MessageContent::RedactedThinking(_)
-                                        )
-                                    });
-                                    let has_thinking = m.content.iter().any(|c| {
-                                        matches!(
-                                            c,
-                                            MessageContent::Thinking(_)
-                                                | MessageContent::RedactedThinking(_)
-                                        )
-                                    });
-                                    if has_thinking {
-                                        // Only accumulate thinking from messages that
-                                        // have not already been split into tool-call
-                                        // request_msg items — prior-split messages
-                                        // already carry their own thinking copy.
-                                        if !m.content.iter().any(|c| {
-                                            matches!(c, MessageContent::ToolRequest(_))
-                                        }) {
-                                            for c in &m.content {
-                                                if matches!(
-                                                    c,
-                                                    MessageContent::Thinking(_)
-                                                        | MessageContent::RedactedThinking(_)
-                                                ) {
-                                                    accumulated_prior.push(c.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if thinking_only {
-                                        indices_to_remove.push(idx);
-                                    } else if has_thinking
-                                        && !m.content.iter().any(|c| {
-                                            matches!(c, MessageContent::ToolRequest(_))
-                                        })
-                                    {
-                                        // Strip thinking blocks from mixed text+thinking
-                                        // messages so the same signed/unsigned thinking is not
-                                        // duplicated when carried onto the tool-call request
-                                        // messages below. Messages that already contain tool
-                                        // requests are prior-split request_msg items whose
-                                        // thinking was already attached — stripping their
-                                        // thinking would leave only the last split message
-                                        // with reasoning, violating the signed-thinking
-                                        // dedup expectation that the first split message
-                                        // retains it.
-                                        m.content.retain(|c| {
-                                            !matches!(
-                                                c,
-                                                MessageContent::Thinking(_)
-                                                    | MessageContent::RedactedThinking(_)
-                                            )
-                                        });
-                                    }
-                                }
-                                // Remove in reverse order to preserve indices
-                                for idx in indices_to_remove.into_iter().rev() {
-                                    messages_to_add.remove(idx);
-                                }
-                                let response_thinking = if direct_thinking.is_empty() {
-                                    accumulated_prior
-                                } else if accumulated_prior.is_empty() {
-                                    direct_thinking
-                                } else {
-                                    let mut merged = accumulated_prior;
-                                    merged.extend(direct_thinking);
-                                    merged
-                                };
+                                let mut turn_thinking = prior_thinking;
+                                turn_thinking.extend(direct_thinking.iter().cloned());
 
                                 let response_message_id = response
                                     .id
                                     .as_deref()
                                     .expect("provider stream responses have IDs");
-                                let has_existing_message_id_carrier = messages_to_add
-                                    .iter()
-                                    .any(|message| {
-                                        message.id.as_deref() == Some(response_message_id)
-                                    });
-                                let carrier_tool_call_id = if has_existing_message_id_carrier {
-                                    None
-                                } else {
-                                    tool_requests
-                                        .first()
-                                        .map(|request| request.id.as_str())
+                                let is_response_message = |message: &Message| {
+                                    message.id.as_deref() == Some(response_message_id)
+                                };
+                                let first_tool_call_id = tool_requests
+                                    .first()
+                                    .map(|request| request.id.as_str());
+                                // A same-id prefix at the tail coalesces with the first request on
+                                // push, so tool-pair hiding removes the thinking with the call.
+                                let carrier_tool_call_id = match messages_to_add.messages().last() {
+                                    Some(last) if is_response_message(last) => first_tool_call_id,
+                                    _ if messages_to_add.iter().any(is_response_message) => None,
+                                    _ => first_tool_call_id,
                                 };
                                 preferred_turn_usage_message_id =
                                     Some(response_message_id.to_owned());
 
-                                for request in &tool_requests {
+                                for (index, request) in tool_requests.iter().enumerate() {
                                     let mut request_msg =
                                         if carrier_tool_call_id == Some(request.id.as_str()) {
                                             Message::assistant().with_id(response_message_id)
@@ -3106,7 +3198,12 @@ impl Agent {
                                             Message::assistant().with_generated_id()
                                         };
 
-                                    for thinking in &response_thinking {
+                                    let thinking = if index == 0 {
+                                        &direct_thinking
+                                    } else {
+                                        &turn_thinking
+                                    };
+                                    for thinking in thinking {
                                         request_msg = request_msg.with_content(thinking.clone());
                                     }
 
@@ -3171,8 +3268,6 @@ impl Agent {
                                 }
 
                                 no_tools_called = false;
-                                // Agent is actively working — re-check goal when it next finishes
-                                goal_check_pending = false;
                             }
                         }
                         #[allow(unused_variables)]
@@ -3320,22 +3415,10 @@ impl Agent {
                 }
                 can_drain_pending_steers = true;
 
-                if tools_updated {
-                    (tools, toolshim_tools, system_prompt, _) =
-                        self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
-                }
-
-                {
-                    let has_new_hints = self
-                        .prompt_manager
-                        .lock()
-                        .await
-                        .load_subdirectory_hints(&working_dir);
-                    if has_new_hints && !tools_updated {
-                        (tools, toolshim_tools, system_prompt, _) =
-                            self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
-                    }
-                }
+                self.prompt_manager
+                    .lock()
+                    .await
+                    .load_subdirectory_hints(&session.working_dir);
 
                 // An empty provider response — no tool calls, no text, and no error
                 // or recovery compaction that legitimately produces no assistant
@@ -3434,7 +3517,9 @@ impl Agent {
                                     session_manager.replace_conversation(&session_config.id, &conversation).await?;
                                     yield AgentEvent::HistoryReplaced(conversation.clone());
                                 }
-                                Ok(RetryResult::Skipped) if empty_response => {
+                                Ok(RetryResult::Skipped)
+                                    if empty_response
+                                        && !ends_with_successful_tool_response(conversation.messages()) => {
                                     // No recipe retry configured, and this empty
                                     // turn would otherwise fall through to a
                                     // silent exit. Retry a bounded number of
@@ -3612,6 +3697,7 @@ impl Agent {
             if !stop_hook_handled_for_exit {
                 self.emit_stop_hook(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy()).await;
             }
+            drop(inference_lease);
         }.instrument(reply_stream_span));
         Ok(inner)
     }
@@ -3649,15 +3735,24 @@ impl Agent {
         session_id: &str,
     ) -> Result<()> {
         let provider_name = provider.get_name().to_string();
+        let registry_entry = crate::providers::get_from_registry(&provider_name)
+            .await
+            .ok();
 
-        let model_config = match crate::providers::get_from_registry(&provider_name).await {
-            Ok(entry) => entry
-                .normalize_model_config(model_config.clone())
-                .unwrap_or(model_config),
-            Err(_) => model_config,
+        let model_config = if registry_entry.is_some() {
+            crate::model_config::materialize_model_config(&provider_name, model_config.clone())
+                .unwrap_or(model_config)
+        } else {
+            model_config
         };
         let effort_support = provider.thinking_effort_support();
         let model_config = normalize_legacy_provider_thinking_effort(model_config, &effort_support);
+        let effective_model_config = match registry_entry {
+            Some(entry) => entry
+                .normalize_model_config(model_config.clone())
+                .unwrap_or_else(|_| model_config.clone()),
+            None => model_config.clone(),
+        };
 
         {
             let mut current_provider = self.provider.lock().await;
@@ -3668,7 +3763,10 @@ impl Agent {
         // own default, so the session's selection has to be pushed to it before
         // the next config snapshot is built. Failures are not fatal here: the
         // selection is re-applied at stream time.
-        if let Err(e) = provider.apply_model_selection(&model_config).await {
+        if let Err(e) = provider
+            .apply_model_selection(&effective_model_config)
+            .await
+        {
             warn!("Failed to apply model selection to provider: {e}");
         }
 
@@ -3925,9 +4023,10 @@ impl Agent {
 
     pub async fn list_extension_prompts(&self, session_id: &str) -> HashMap<String, Vec<Prompt>> {
         self.extension_manager
-            .list_prompts(session_id, CancellationToken::default())
+            .current_lease(session_id, None)
             .await
-            .expect("Failed to list prompts")
+            .list_prompts(CancellationToken::default())
+            .await
     }
 
     pub async fn get_prompt(
@@ -3936,295 +4035,33 @@ impl Agent {
         name: &str,
         arguments: Value,
     ) -> Result<GetPromptResult> {
-        // First find which extension has this prompt
-        let prompts = self
-            .extension_manager
-            .list_prompts(session_id, CancellationToken::default())
-            .await
-            .map_err(|e| anyhow!("Failed to list prompts: {}", e))?;
+        let lease = self.extension_manager.current_lease(session_id, None).await;
+        let prompts = lease.list_prompts(CancellationToken::default()).await;
 
         if let Some(extension) = prompts
             .iter()
             .find(|(_, prompt_list)| prompt_list.iter().any(|p| p.name == name))
             .map(|(extension, _)| extension)
         {
-            return self
-                .extension_manager
-                .get_prompt(
-                    session_id,
-                    extension,
-                    name,
-                    arguments,
-                    CancellationToken::default(),
-                )
-                .await
-                .map_err(|e| anyhow!("Failed to get prompt: {}", e));
+            return lease
+                .get_prompt(extension, name, arguments, CancellationToken::default())
+                .await;
         }
 
         Err(anyhow!("Prompt '{}' not found", name))
     }
-
-    pub async fn get_plan_prompt(&self, session_id: &str) -> Result<String> {
-        let tools = self
-            .extension_manager
-            .get_prefixed_tools(session_id, None)
-            .await?;
-        let tools_info: Vec<_> = tools
-            .into_iter()
-            .map(|tool| {
-                ToolInfo::new(
-                    &tool.name,
-                    tool.description
-                        .as_ref()
-                        .map(|d| d.as_ref())
-                        .unwrap_or_default(),
-                    get_parameter_names(&tool),
-                    None,
-                )
-            })
-            .collect();
-
-        let context = HashMap::from([("tools", serde_json::to_value(tools_info)?)]);
-        Ok(crate::prompt_template::render_template(
-            "plan.md", &context,
-        )?)
-    }
-
-    pub async fn create_recipe(
-        &self,
-        session_id: &str,
-        mut messages: Conversation,
-    ) -> Result<Recipe> {
-        tracing::info!("Starting recipe creation with {} messages", messages.len());
-
-        let session = self
-            .config
-            .session_manager
-            .get_session(session_id, false)
-            .await?;
-        let extensions_info = self
-            .extension_manager
-            .get_extensions_info(&session.working_dir)
-            .await;
-        tracing::debug!("Retrieved {} extensions info", extensions_info.len());
-
-        let model_config = self.model_config_for_session(session_id).await?;
-        let model_name = &model_config.model_name;
-        tracing::debug!("Using model: {}", model_name);
-
-        let goose_mode = *self.current_goose_mode.lock().await;
-        let prompt_manager = self.prompt_manager.lock().await;
-        let system_prompt = prompt_manager
-            .builder()
-            .with_extensions(extensions_info.into_iter())
-            .with_goose_mode(goose_mode)
-            .build();
-
-        let recipe_prompt = prompt_manager.get_recipe_prompt().await;
-        let tools: Vec<_> = self
-            .extension_manager
-            .get_prefixed_tools(session_id, None)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to get tools for recipe creation: {}", e);
-                e
-            })?
-            .into_iter()
-            .filter(super::reply_parts::is_tool_visible_to_model)
-            .collect();
-
-        messages = Conversation::new_unvalidated(recipe_conversation_history(&messages));
-        messages.push(Message::user().with_text(recipe_prompt));
-
-        let (messages, issues) = fix_conversation(messages);
-        if !issues.is_empty() {
-            issues
-                .iter()
-                .for_each(|issue| tracing::warn!(recipe.conversation.issue = issue));
-        }
-        let messages = Conversation::new_unvalidated(merge_consecutive_messages_for_request(
-            messages.messages().clone(),
-        ));
-
-        tracing::debug!(
-            "Added recipe prompt to messages, total messages: {}",
-            messages.len()
-        );
-
-        tracing::info!("Calling provider to generate recipe content");
-        let provider = self.provider.lock().await;
-        let provider = provider.as_ref().ok_or_else(|| {
-            let error = anyhow!("Provider not available during recipe creation");
-            tracing::error!("{}", error);
-            error
-        })?;
-        let (result, _usage) = crate::session_context::with_session_id(
-            Some(session_id.to_string()),
-            provider.complete(&model_config, &system_prompt, messages.messages(), &tools),
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Provider completion failed during recipe creation: {}", e);
-            e
-        })?;
-
-        let content = result.as_concat_text();
-        tracing::debug!(
-            "Provider returned content with {} characters",
-            content.len()
-        );
-
-        // the response may be contained in ```json ```, strip that before parsing json
-        let re = Regex::new(r"(?s)```[^\n]*\n(.*?)\n```").unwrap();
-        let clean_content = re
-            .captures(&content)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str()))
-            .unwrap_or(&content)
-            .trim()
-            .to_string();
-
-        let (instructions, activities) =
-            if let Ok(json_content) = serde_json::from_str::<Value>(&clean_content) {
-                let instructions = json_content
-                    .get("instructions")
-                    .ok_or_else(|| anyhow!("Missing 'instructions' in json response"))?
-                    .as_str()
-                    .ok_or_else(|| anyhow!("instructions' is not a string"))?
-                    .to_string();
-
-                let activities = json_content
-                    .get("activities")
-                    .ok_or_else(|| anyhow!("Missing 'activities' in json response"))?
-                    .as_array()
-                    .ok_or_else(|| anyhow!("'activities' is not an array'"))?
-                    .iter()
-                    .map(|act| {
-                        act.as_str()
-                            .map(|s| s.to_string())
-                            .ok_or(anyhow!("'activities' array element is not a string"))
-                    })
-                    .collect::<Result<_, _>>()?;
-
-                (instructions, activities)
-            } else {
-                tracing::warn!("Failed to parse JSON, falling back to string parsing");
-                // If we can't get valid JSON, try string parsing
-                // Use split_once to get the content after "Instructions:".
-                let after_instructions = content
-                    .split_once("instructions:")
-                    .map(|(_, rest)| rest)
-                    .unwrap_or(&content);
-
-                // Split once more to separate instructions from activities.
-                let (instructions_part, activities_text) = after_instructions
-                    .split_once("activities:")
-                    .unwrap_or((after_instructions, ""));
-
-                let instructions = instructions_part
-                    .trim_end_matches(|c: char| c.is_whitespace() || c == '#')
-                    .trim()
-                    .to_string();
-                let activities_text = activities_text.trim();
-
-                // Regex to remove bullet markers or numbers with an optional dot.
-                let bullet_re = Regex::new(r"^[•\-*\d]+\.?\s*").expect("Invalid regex");
-
-                // Process each line in the activities section.
-                let activities: Vec<String> = activities_text
-                    .lines()
-                    .map(|line| bullet_re.replace(line, "").to_string())
-                    .map(|s| s.trim().to_string())
-                    .filter(|line| !line.is_empty())
-                    .collect();
-
-                (instructions, activities)
-            };
-
-        let extension_configs = get_enabled_extensions();
-
-        let author = Author {
-            contact: std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .ok(),
-            metadata: None,
-        };
-
-        // Ideally we'd get the name of the provider we are using from the provider itself,
-        // but it doesn't know and the plumbing looks complicated.
-        let config = Config::global();
-        let provider_name: String = config
-            .get_goose_provider()
-            .expect("No provider configured. Run 'goose configure' first");
-
-        let settings = Settings {
-            goose_provider: Some(provider_name.clone()),
-            goose_model: Some(model_name.clone()),
-            temperature: Some(model_config.temperature.unwrap_or(0.0)),
-            max_turns: None,
-        };
-
-        tracing::debug!(
-            "Building recipe with {} activities and {} extensions",
-            activities.len(),
-            extension_configs.len()
-        );
-
-        let (title, description) =
-            if let Ok(json_content) = serde_json::from_str::<Value>(&clean_content) {
-                let title = json_content
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("Custom recipe from chat")
-                    .to_string();
-
-                let description = json_content
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("a custom recipe instance from this chat session")
-                    .to_string();
-
-                (title, description)
-            } else {
-                (
-                    "Custom recipe from chat".to_string(),
-                    "a custom recipe instance from this chat session".to_string(),
-                )
-            };
-
-        let recipe = Recipe::builder()
-            .title(title)
-            .description(description)
-            .instructions(instructions)
-            .activities(activities)
-            .extensions(extension_configs)
-            .settings(settings)
-            .author(author)
-            .build()
-            .map_err(|e| {
-                tracing::error!("Failed to build recipe: {}", e);
-                anyhow!("Recipe build failed: {}", e)
-            })?;
-
-        tracing::info!("Recipe creation completed successfully");
-        Ok(recipe)
-    }
-}
-
-fn recipe_conversation_history(messages: &Conversation) -> Vec<Message> {
-    // The recipe prompt has no turn-context instructions; drop the blocks.
-    messages
-        .agent_visible_messages()
-        .into_iter()
-        .filter(|message| !message.is_turn_context())
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agents::gen_ai_telemetry::{self, test_support::SpanFieldCapture};
+    use crate::agents::mcp_client::{Error as McpClientError, McpClientTrait};
+    use crate::agents::ToolCallContext;
     use crate::plugins::discovery::{DiscoveredPlugin, PluginScope};
-    use crate::providers::base::{stream_from_single_message, MessageStream, PermissionRouting};
+    use crate::providers::base::{
+        stream_from_single_message, MessageStream, ModelInfo, PermissionRouting,
+    };
     use crate::recipe::Response;
     use crate::session::session_manager::SessionType;
     use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
@@ -4242,6 +4079,295 @@ mod tests {
             bundled: None,
             available_tools: Vec::new(),
         }
+    }
+
+    fn platform_extension(name: &str) -> ExtensionConfig {
+        ExtensionConfig::Platform {
+            name: name.to_string(),
+            description: String::new(),
+            display_name: None,
+            bundled: None,
+            available_tools: Vec::new(),
+        }
+    }
+
+    struct LeaseValueClient(&'static str);
+
+    #[async_trait::async_trait]
+    impl McpClientTrait for LeaseValueClient {
+        async fn list_tools(
+            &self,
+            _session_id: &str,
+            _next_cursor: Option<String>,
+            _cancellation_token: CancellationToken,
+        ) -> std::result::Result<rmcp::model::ListToolsResult, McpClientError> {
+            Ok(rmcp::model::ListToolsResult::with_all_items(vec![
+                Tool::new(
+                    "value".to_string(),
+                    "Return the client value".to_string(),
+                    Arc::new(serde_json::Map::new()),
+                ),
+            ]))
+        }
+
+        async fn call_tool(
+            &self,
+            _ctx: &ToolCallContext,
+            _name: &str,
+            _arguments: Option<rmcp::model::JsonObject>,
+            _cancellation_token: CancellationToken,
+        ) -> std::result::Result<CallToolResult, McpClientError> {
+            Ok(CallToolResult::success(vec![ContentBlock::text(self.0)]))
+        }
+
+        fn get_info(&self) -> Option<&rmcp::model::InitializeResult> {
+            None
+        }
+
+        async fn get_moim(&self, _session_id: &str, _tools: &[Tool]) -> Option<String> {
+            Some(format!("<lease-value>{}</lease-value>", self.0))
+        }
+    }
+
+    struct RefreshingLeaseProvider {
+        manager: std::sync::Mutex<Option<Arc<ExtensionManager>>>,
+        turn_contexts: std::sync::Mutex<Vec<String>>,
+        call_count: AtomicUsize,
+    }
+
+    impl RefreshingLeaseProvider {
+        fn new() -> Self {
+            Self {
+                manager: std::sync::Mutex::new(None),
+                turn_contexts: std::sync::Mutex::new(Vec::new()),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for RefreshingLeaseProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system_prompt: &str,
+            messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            self.turn_contexts.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(Message::as_concat_text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let message = if call == 0 {
+                let manager = self
+                    .manager
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("extension manager unavailable");
+                manager
+                    .add_client(
+                        platform_extension("changing"),
+                        Arc::new(LeaseValueClient("second")),
+                        None,
+                    )
+                    .await;
+                Message::assistant().with_tool_request(
+                    "refresh-context",
+                    Ok(CallToolRequestParams::new("changing__value")),
+                )
+            } else {
+                Message::assistant().with_text("done")
+            };
+            Ok(stream_from_single_message(
+                message,
+                ProviderUsage::new("mock-model".to_string(), Usage::default()),
+            ))
+        }
+
+        fn get_name(&self) -> &str {
+            "refreshing-lease"
+        }
+
+        async fn get_context_limit(&self, _model: &str, _override_limit: Option<usize>) -> usize {
+            100_000
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_dispatches_use_their_inference_lease() {
+        let (agent, session, _data_dir) = tracing_test_agent_and_session().await;
+        agent
+            .extension_manager
+            .add_client(
+                persisted_builtin("changing"),
+                Arc::new(LeaseValueClient("first")),
+                None,
+            )
+            .await;
+        let first_lease = agent.resolve_lease(&session.id, &session.working_dir).await;
+
+        agent
+            .extension_manager
+            .add_client(
+                persisted_builtin("changing"),
+                Arc::new(LeaseValueClient("second")),
+                None,
+            )
+            .await;
+        let second_lease = agent.resolve_lease(&session.id, &session.working_dir).await;
+
+        let first = agent.dispatch_tool_call_on(
+            &first_lease,
+            CallToolRequestParams::new("changing__value"),
+            "first-call".to_string(),
+            None,
+            &session,
+        );
+        let second = agent.dispatch_tool_call_on(
+            &second_lease,
+            CallToolRequestParams::new("changing__value"),
+            "second-call".to_string(),
+            None,
+            &session,
+        );
+        let ((_, first), (_, second)) = tokio::join!(first, second);
+        let first = first.unwrap().result.await.unwrap();
+        let second = second.unwrap().result.await.unwrap();
+
+        assert_eq!(first.content[0].as_text().unwrap().text, "first");
+        assert_eq!(second.content[0].as_text().unwrap().text, "second");
+    }
+
+    #[tokio::test]
+    async fn legacy_inference_refreshes_extension_context() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let provider = Arc::new(RefreshingLeaseProvider::new());
+        let (agent, session_id) = create_test_agent(
+            temp_dir.path().join("data"),
+            crate::hooks::HookManager::from_plugins_for_test(vec![]),
+            provider.clone(),
+        )
+        .await?;
+        *provider.manager.lock().unwrap() = Some(Arc::clone(&agent.extension_manager));
+
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("refresh extension context"),
+                SessionConfig {
+                    id: session_id,
+                    schedule_id: None,
+                    max_turns: Some(100),
+                    retry_config: None,
+                },
+                false,
+                None,
+            )
+            .await?;
+        while let Some(event) = stream.next().await {
+            event?;
+        }
+
+        let contexts = provider.turn_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert!(!contexts[0].contains("<lease-value>second</lease-value>"));
+        assert!(contexts[1].contains("<lease-value>second</lease-value>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inference_context_uses_the_lease_session_snapshot() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let new_working_dir = temp_dir.path().join("moved");
+        std::fs::create_dir(&new_working_dir)?;
+        std::fs::write(
+            new_working_dir.join("AGENTS.md"),
+            "instructions from the moved directory",
+        )?;
+        let (agent, session_id) = create_test_agent(
+            temp_dir.path().join("data"),
+            crate::hooks::HookManager::from_plugins_for_test(vec![]),
+            Arc::new(RefreshingLeaseProvider::new()),
+        )
+        .await?;
+        let stale_session = agent
+            .config
+            .session_manager
+            .get_session(&session_id, false)
+            .await?;
+        agent
+            .extension_manager
+            .add_client(
+                persisted_builtin("changing"),
+                Arc::new(LeaseValueClient("value")),
+                None,
+            )
+            .await;
+        agent
+            .update_extension_working_dir(&session_id, &new_working_dir)
+            .await?;
+
+        let (session, lease, tools, _, system_prompt, _) =
+            agent.prepare_tools_and_prompt(&stale_session).await?;
+
+        assert_eq!(session.working_dir, new_working_dir);
+        assert_eq!(lease.working_dir(), Some(session.working_dir.as_path()));
+        assert!(tools.iter().any(|tool| tool.name == "changing__value"));
+        assert!(system_prompt.contains("instructions from the moved directory"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mangled_manage_extensions_call_applies_its_mutation() {
+        let (agent, session, _data_dir) = tracing_test_agent_and_session().await;
+        agent
+            .add_extension(
+                ExtensionConfig::Platform {
+                    name: "extensionmanager".to_string(),
+                    description: String::new(),
+                    display_name: None,
+                    bundled: None,
+                    available_tools: Vec::new(),
+                },
+                &session.id,
+            )
+            .await
+            .unwrap();
+        let lease = agent.resolve_lease(&session.id, &session.working_dir).await;
+        let tool_call =
+            CallToolRequestParams::new("functions.extensionmanager__manage_extensions".to_string())
+                .with_arguments(rmcp::object!({
+                    "action": "enable",
+                    "extension_name": "analyze",
+                }));
+
+        let (_, result) = agent
+            .dispatch_tool_call_on(&lease, tool_call, "manage".to_string(), None, &session)
+            .await;
+        result.unwrap().result.await.unwrap();
+
+        assert!(agent
+            .extension_manager
+            .list_extensions()
+            .await
+            .unwrap()
+            .contains(&"analyze".to_string()));
+        let stored_session = agent
+            .config
+            .session_manager
+            .get_session(&session.id, false)
+            .await
+            .unwrap();
+        let stored_extensions =
+            EnabledExtensionsState::from_extension_data(&stored_session.extension_data).unwrap();
+        assert!(stored_extensions
+            .extensions
+            .iter()
+            .any(|config| config.key() == "analyze"));
     }
 
     #[test]
@@ -4307,23 +4433,182 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recipe_history_excludes_turn_context_events() {
-        use crate::conversation::message::MessageMetadata;
+    #[derive(Debug, Default)]
+    struct SessionContextProvider {
+        calls: std::sync::Mutex<Vec<(&'static str, Option<String>)>>,
+    }
 
-        let history = Conversation::new_unvalidated([
-            Message::user().with_text("build me a recipe"),
-            Message::user()
-                .with_text("<turn-context>cwd /repo</turn-context>")
-                .with_metadata(MessageMetadata::agent_only().with_turn_context()),
-            Message::assistant().with_text("on it"),
-        ]);
+    impl SessionContextProvider {
+        fn record(&self, operation: &'static str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((operation, crate::session_context::current_session_id()));
+        }
 
-        let texts: Vec<String> = recipe_conversation_history(&history)
-            .iter()
-            .map(|message| message.as_concat_text())
-            .collect();
-        assert_eq!(texts, ["build me a recipe", "on it"]);
+        fn calls(&self) -> Vec<(&'static str, Option<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for SessionContextProvider {
+        fn get_name(&self) -> &str {
+            "session-context"
+        }
+
+        async fn resume(&self, _session_id: &str) -> Result<(), ProviderError> {
+            self.record("resume");
+            Ok(())
+        }
+
+        async fn fetch_model_info(&self, model_name: &str) -> Result<ModelInfo, ProviderError> {
+            self.record("fetch_model_info");
+            Ok(ModelInfo::new(model_name).with_context_limit(32_000))
+        }
+
+        async fn get_context_limit(&self, _model: &str, _override_limit: Option<usize>) -> usize {
+            self.record("get_context_limit");
+            32_000
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            self.record("stream");
+            Ok(stream_from_single_message(
+                Message::assistant().with_text("done"),
+                ProviderUsage::new("mock-model".to_string(), Usage::default()),
+            ))
+        }
+    }
+
+    async fn session_context_agent() -> (Agent, Arc<SessionContextProvider>, SessionConfig, TempDir)
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+        let agent = Agent::with_config(AgentConfig::new(
+            Arc::clone(&session_manager),
+            Arc::new(PermissionManager::new(temp_dir.path().join("permissions"))),
+            None,
+            GooseMode::default(),
+            true,
+            GoosePlatform::GooseCli,
+        ));
+        let session = session_manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "session-context".to_string(),
+                SessionType::Hidden,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        let provider = Arc::new(SessionContextProvider::default());
+        agent
+            .update_provider(
+                provider.clone(),
+                goose_providers::model::ModelConfig::new("mock-model"),
+                &session.id,
+            )
+            .await
+            .unwrap();
+        session_manager
+            .add_message(&session.id, &Message::user().with_text("initial request"))
+            .await
+            .unwrap();
+        session_manager
+            .add_message(
+                &session.id,
+                &Message::assistant()
+                    .with_text("previous response")
+                    .with_inference(InferenceMetadata {
+                        provider: provider.get_name().to_string(),
+                        requested_model: "mock-model".to_string(),
+                        resolved_model: None,
+                        provider_session_id: Some("saved-provider-session".to_string()),
+                    }),
+            )
+            .await
+            .unwrap();
+
+        let session_config = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: Some(1),
+            retry_config: None,
+        };
+
+        (agent, provider, session_config, temp_dir)
+    }
+
+    fn assert_session_context_calls(
+        provider: &SessionContextProvider,
+        session_id: &str,
+        operations: &[&'static str],
+    ) {
+        let calls = provider.calls();
+        for operation in operations {
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call == &(*operation, Some(session_id.to_string()))),
+                "{operation} was not scoped to session {session_id}: {calls:?}"
+            );
+        }
+        assert_eq!(crate::session_context::current_session_id(), None);
+    }
+
+    #[tokio::test]
+    async fn reply_scopes_resume_model_info_and_stream_to_session() {
+        let (agent, provider, session_config, _temp_dir) = session_context_agent().await;
+        let session_id = session_config.id.clone();
+        let mut events = agent
+            .reply(
+                Message::user().with_text("continue"),
+                session_config,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        while let Some(event) = events.next().await {
+            event.unwrap();
+        }
+
+        assert_session_context_calls(
+            provider.as_ref(),
+            &session_id,
+            &["resume", "fetch_model_info", "stream"],
+        );
+    }
+
+    #[tokio::test]
+    async fn live_delegation_scopes_state_machine_setup_and_stream_to_session() {
+        let (agent, provider, mut session_config, _temp_dir) = session_context_agent().await;
+        session_config.max_turns = Some(2);
+        let session_id = session_config.id.clone();
+        let mut events = agent
+            .reply_live_delegation(
+                Message::user().with_text("continue"),
+                session_config,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        while let Some(event) = events.next().await {
+            event.unwrap();
+        }
+
+        assert_session_context_calls(
+            provider.as_ref(),
+            &session_id,
+            &["get_context_limit", "stream"],
+        );
     }
 
     async fn tracing_test_agent_and_session() -> (Agent, Session, TempDir) {
@@ -4781,6 +5066,96 @@ mod tests {
             effort_test_agent(EffortOutcome::Applied).await;
 
         assert_eq!(provider.model_selections(), ["mock-model"]);
+    }
+
+    #[tokio::test]
+    async fn provider_toolshim_is_effective_without_being_persisted() {
+        let (agent, session, _data_dir) = tracing_test_agent_and_session().await;
+        let provider_root = TempDir::new().unwrap();
+        let provider_root_path = provider_root.path().display().to_string();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(provider_root_path.as_str())),
+            ("GOOSE_TOOLSHIM", None),
+        ]);
+
+        let config = crate::config::declarative_providers::create_custom_provider(
+            crate::config::declarative_providers::CreateCustomProviderParams {
+                engine: "openai".to_string(),
+                display_name: "Sticky Toolshim".to_string(),
+                api_url: "https://example.invalid/v1".to_string(),
+                api_key: None,
+                models: vec![crate::providers::base::ModelInfo::new("test-model")],
+                supports_streaming: Some(true),
+                headers: None,
+                requires_auth: false,
+                catalog_provider_id: None,
+                base_path: None,
+                toolshim: true,
+                preserves_thinking: None,
+                auth: None,
+            },
+        )
+        .unwrap();
+        crate::providers::refresh_custom_providers().await.unwrap();
+
+        let provider = crate::providers::create(&config.name, Vec::new())
+            .await
+            .unwrap();
+        agent
+            .update_provider(
+                provider,
+                goose_providers::model::ModelConfig::new("test-model"),
+                &session.id,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !agent
+                .model_config_for_session(&session.id)
+                .await
+                .unwrap()
+                .toolshim
+        );
+        assert!(
+            agent
+                .effective_model_config_for_session(&session.id)
+                .await
+                .unwrap()
+                .toolshim
+        );
+
+        crate::config::declarative_providers::update_custom_provider(
+            crate::config::declarative_providers::UpdateCustomProviderParams {
+                id: config.name.clone(),
+                engine: "openai".to_string(),
+                display_name: config.display_name,
+                api_url: config.base_url,
+                api_key: None,
+                models: config.models,
+                supports_streaming: config.supports_streaming,
+                headers: config.headers,
+                requires_auth: false,
+                catalog_provider_id: None,
+                base_path: None,
+                toolshim: false,
+                preserves_thinking: None,
+                auth: None,
+            },
+        )
+        .unwrap();
+        crate::providers::refresh_custom_providers().await.unwrap();
+
+        assert!(
+            !agent
+                .effective_model_config_for_session(&session.id)
+                .await
+                .unwrap()
+                .toolshim
+        );
+
+        crate::config::declarative_providers::remove_custom_provider(&config.name).unwrap();
+        crate::providers::refresh_custom_providers().await.unwrap();
     }
 
     #[tokio::test]
@@ -5245,7 +5620,12 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         };
 
         let reply_stream = agent
-            .reply(Message::user().with_text("hi"), session_config, None)
+            .reply(
+                Message::user().with_text("hi"),
+                session_config,
+                crate::agents::state_machine::enabled(),
+                None,
+            )
             .await?;
         tokio::pin!(reply_stream);
         let mut emitted_refusal_id = None;
@@ -5355,6 +5735,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .reply(
                 Message::user().with_text("input-super-secret-token"),
                 session_config,
+                false,
                 None,
             )
             .await?;
@@ -5438,7 +5819,12 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             retry_config: None,
         };
         let reply_stream = agent
-            .reply(Message::user().with_text(text), session_config, None)
+            .reply(
+                Message::user().with_text(text),
+                session_config,
+                crate::agents::state_machine::enabled(),
+                None,
+            )
             .await?;
         tokio::pin!(reply_stream);
 
@@ -5574,6 +5960,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .reply(
                 Message::user().with_content(user_only_content),
                 session_config,
+                crate::agents::state_machine::enabled(),
                 None,
             )
             .await?;
@@ -5600,6 +5987,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .reply(
                 Message::user().with_text("agent-visible"),
                 visible_session_config,
+                crate::agents::state_machine::enabled(),
                 None,
             )
             .await?;
@@ -5619,6 +6007,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .reply(
                 Message::user().with_text("second-agent-visible"),
                 final_session_config,
+                crate::agents::state_machine::enabled(),
                 None,
             )
             .await?;
@@ -6046,16 +6435,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         }
     }
 
-    const RECORD_PRE_SCRIPT: &str =
-        "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\nexit 0\n";
-    const RECORD_RESULT_SCRIPT: &str =
-        "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/result.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/result.log\"\nexit 0\n";
-    const RECORD_POST_SCRIPT: &str =
-        "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/post.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/post.log\"\nexit 0\n";
-    const RECORD_POST_FAILURE_SCRIPT: &str =
-        "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/postfail.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/postfail.log\"\nexit 0\n";
-    const DENY_AND_RECORD_SCRIPT: &str =
-        "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\necho \"blocked by test policy\" >&2\nexit 2\n";
+    const RECORD_PRE_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\nexit 0\n";
+    const RECORD_RESULT_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/result.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/result.log\"\nexit 0\n";
+    const RECORD_POST_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/post.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/post.log\"\nexit 0\n";
+    const RECORD_POST_FAILURE_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/postfail.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/postfail.log\"\nexit 0\n";
+    const DENY_AND_RECORD_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\necho \"blocked by test policy\" >&2\nexit 2\n";
     /// Logs its stdin like the others, writes nothing to stdout, and exits
     /// non-zero. That is a hook that ran but never returned a decision.
     const ABNORMAL_EXIT_AND_RECORD_SCRIPT: &str =

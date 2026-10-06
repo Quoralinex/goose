@@ -9,6 +9,7 @@ use crate::formats::openai::{
     extract_reasoning_effort, is_openai_responses_model, openai_reasoning_effort_for_thinking,
     sanitize_function_name,
 };
+use crate::maybe_send::MaybeSend;
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::ModelConfig;
 use crate::utils::{sanitize_unicode_tags, strip_unicode_tags};
@@ -149,21 +150,22 @@ pub struct ResponseUsage {
 pub struct InputTokensDetails {
     #[serde(default)]
     pub cached_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i32>,
 }
 
 impl ResponseUsage {
     fn to_usage(&self) -> Usage {
-        // input_tokens already includes cached tokens
-        let cached_tokens = self
-            .input_tokens_details
-            .as_ref()
-            .and_then(|d| d.cached_tokens);
+        // input_tokens already includes both cache reads and cache writes
+        let details = self.input_tokens_details.as_ref();
+        let cached_tokens = details.and_then(|d| d.cached_tokens);
+        let cache_write_tokens = details.and_then(|d| d.cache_write_tokens);
         Usage::new(
             Some(self.input_tokens),
             Some(self.output_tokens),
             Some(self.total_tokens),
         )
-        .with_cache_tokens(cached_tokens, None)
+        .with_cache_tokens(cached_tokens, cache_write_tokens)
     }
 }
 
@@ -1005,7 +1007,7 @@ pub fn responses_api_to_streaming_message<S>(
     mut stream: S,
 ) -> impl Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
 where
-    S: Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+    S: Stream<Item = anyhow::Result<String>> + Unpin + MaybeSend + 'static,
 {
     try_stream! {
         use futures::StreamExt;
@@ -1630,12 +1632,8 @@ mod tests {
         });
 
         let lines = vec![
-            format!(
-                r#"data: {{"type":"response.created","sequence_number":1,"response":{{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5","output":[]}}}}"#
-            ),
-            format!(
-                r#"data: {{"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":1,"content_index":0,"delta":"Paris."}}"#
-            ),
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-5","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":1,"content_index":0,"delta":"Paris."}"#.to_string(),
             format!(
                 r#"data: {{"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{}}}"#,
                 serde_json::to_string(&reasoning_item)?
@@ -2038,6 +2036,36 @@ mod tests {
         assert_eq!(result["model"], "gpt-5.6-sol");
         assert_eq!(result["reasoning"]["effort"], "xhigh");
         assert_eq!(result["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn test_responses_request_always_on_gpt6_off_uses_low_not_none() {
+        for model_name in [
+            "gpt-6-astra",
+            "data_workflow_tools.goose.goose-gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-1-sol",
+            "goose-gpt-6-1-sol",
+            "catalog.schema.goose-gpt-6-1-sol",
+            "openrouter/openai/gpt-6-1-sol",
+        ] {
+            let model_config = ModelConfig::new(model_name)
+                .with_thinking_effort(crate::thinking::ThinkingEffort::Off);
+
+            let result =
+                create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
+
+            assert_eq!(result["model"], model_name, "{model_name}");
+            assert_eq!(
+                result["reasoning"]["effort"], "low",
+                "{model_name} Off should serialize as low, not none"
+            );
+        }
+
+        let model_config = ModelConfig::new("gpt-5.6-luna")
+            .with_thinking_effort(crate::thinking::ThinkingEffort::Off);
+        let result = create_responses_request(&model_config, "You are helpful.", &[], &[]).unwrap();
+        assert_eq!(result["reasoning"]["effort"], "none");
     }
 
     #[test]

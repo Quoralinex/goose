@@ -305,7 +305,7 @@ impl GooseAcpAgent {
         let task_acp_session_id = acp_session_id.clone();
         if let Err(error) = cx.spawn(async move {
             let _run_guard = ActiveRunDropGuard {
-                registry: server.active_prompt_runs.clone(),
+                registry: server.active_runs.clone(),
                 session_id: task_session_id.clone(),
                 run_id: task_run_id.clone(),
                 cancel_token: task_cancel_token.clone(),
@@ -327,6 +327,7 @@ impl GooseAcpAgent {
                         &task_acp_session_id,
                         &task_session_id,
                         &task_agent,
+                        &mut None,
                     )
                     .await
                 {
@@ -426,9 +427,9 @@ impl GooseAcpAgent {
             .internal_err_ctx("Failed to reload session")?;
 
         agent
-            .extension_manager
-            .update_working_dir(&session.working_dir)
-            .await;
+            .update_extension_working_dir(&session.id, &session.working_dir)
+            .await
+            .internal_err_ctx("Failed to update extension working directory")?;
 
         let (mode_state, config_options) = build_session_setup_config(
             &self.provider_inventory,

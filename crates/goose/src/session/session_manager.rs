@@ -1,9 +1,10 @@
 use crate::config::paths::Paths;
 use crate::config::GooseMode;
-use crate::conversation::message::{Message, MessageUsage, TokenState};
+use crate::conversation::message::{Message, MessageMetadata, MessageUsage, TokenState};
 use crate::conversation::Conversation;
 use crate::providers::base::CostSource;
 use crate::providers::base::Provider;
+use crate::recipe::validate_recipe::strip_unreferenced_parameters;
 use crate::recipe::Recipe;
 use crate::session::export_markdown::export_session_to_markdown;
 use crate::session::extension_data::ExtensionData;
@@ -265,7 +266,7 @@ impl<'a> SessionUpdateBuilder<'a> {
     }
 
     pub fn recipe(mut self, recipe: Option<Recipe>) -> Self {
-        self.recipe = Some(recipe);
+        self.recipe = Some(recipe.map(strip_unreferenced_parameters));
         self
     }
 
@@ -458,6 +459,16 @@ impl SessionManager {
 
     pub async fn replace_conversation(&self, id: &str, conversation: &Conversation) -> Result<()> {
         self.storage.replace_conversation(id, conversation).await
+    }
+
+    pub(crate) async fn save_compacted_conversation(
+        &self,
+        id: &str,
+        conversation: &Conversation,
+    ) -> Result<()> {
+        self.storage
+            .save_compacted_conversation(id, conversation)
+            .await
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -928,6 +939,12 @@ impl SessionStorage {
     fn create_pool(path: &Path) -> Pool<Sqlite> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("Failed to create session database directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                    .expect("Failed to secure session database directory");
+            }
         }
 
         let options = SqliteConnectOptions::new()
@@ -1174,7 +1191,9 @@ impl SessionStorage {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let recipe_json = match &session.recipe {
-            Some(recipe) => Some(serde_json::to_string(recipe)?),
+            Some(recipe) => Some(serde_json::to_string(&strip_unreferenced_parameters(
+                recipe.clone(),
+            ))?),
             None => None,
         };
 
@@ -1994,6 +2013,62 @@ impl SessionStorage {
         Self::replace_conversation_inner(pool, session_id, conversation).await
     }
 
+    async fn save_compacted_conversation(
+        &self,
+        session_id: &str,
+        conversation: &Conversation,
+    ) -> Result<()> {
+        let pool = self.pool().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        for message in conversation.messages() {
+            let message_id = message
+                .id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("compacted conversation message has no id"))?;
+            let stored_metadata_json = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT metadata_json FROM messages WHERE session_id = ? AND message_id = ?",
+            )
+            .bind(session_id)
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(stored_metadata_json) = stored_metadata_json {
+                let mut metadata = stored_metadata_json
+                    .and_then(|json| serde_json::from_str::<MessageMetadata>(&json).ok())
+                    .unwrap_or_default();
+                metadata.agent_visible = message.metadata.agent_visible;
+                sqlx::query(
+                    "UPDATE messages SET metadata_json = ? WHERE session_id = ? AND message_id = ?",
+                )
+                .bind(serde_json::to_string(&metadata)?)
+                .bind(session_id)
+                .bind(message_id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(message_id)
+                .bind(session_id)
+                .bind(role_to_string(&message.role))
+                .bind(serde_json::to_string(&message.content)?)
+                .bind(message.created)
+                .bind(serde_json::to_string(&message.metadata)?)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        sqlx::query("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn list_sessions_matching(&self, query: SessionListQuery<'_>) -> Result<Vec<Session>> {
         let filters = &query.filters;
         if matches!(filters.types, Some(types) if types.is_empty()) {
@@ -2788,6 +2863,58 @@ mod tests {
     const NUM_CONCURRENT_SESSIONS: i32 = 10;
     const GENERATED_SESSION_NAME: &str = "Generated session name";
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_directory_is_owner_private_for_fresh_and_existing_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join(SESSIONS_FOLDER);
+        let database_path = session_dir.join(DB_NAME);
+
+        let storage = SessionStorage::new(temp_dir.path().to_path_buf());
+        storage.pool().await.unwrap();
+        assert_eq!(
+            fs::metadata(&session_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        storage.pool.close().await;
+        drop(storage);
+
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            fs::metadata(&database_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(&session_dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let session_manager = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = session_manager
+            .create_session(
+                PathBuf::from("/tmp/private-session-store"),
+                "Private session".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        let loaded = session_manager
+            .get_session(&session.id, false)
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.name, "Private session");
+        assert_eq!(
+            fs::metadata(&session_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     #[test]
     fn azure_session_model_config_preserves_suffixed_deployment_id() {
         let json = serde_json::to_string(&ModelConfig {
@@ -3467,6 +3594,61 @@ mod tests {
             .await
             .unwrap();
         assert!(update.is_none());
+    }
+
+    #[tokio::test]
+    async fn storing_a_rendered_recipe_strips_inert_parameters() {
+        use crate::recipe::{
+            RecipeParameter, RecipeParameterInputType, RecipeParameterRequirement,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = sm
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "Recipe snapshot".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+
+        let rendered = Recipe::builder()
+            .title("snapshot")
+            .description("rendered")
+            .prompt("hello")
+            .parameters(vec![RecipeParameter {
+                key: "message".to_string(),
+                input_type: RecipeParameterInputType::String,
+                requirement: RecipeParameterRequirement::Required,
+                description: "message parameter".to_string(),
+                default: None,
+                options: None,
+            }])
+            .build()
+            .unwrap();
+
+        crate::recipe::validate_recipe::validate_recipe_template_from_content(
+            &rendered.to_yaml().unwrap(),
+            None,
+        )
+        .unwrap_err();
+
+        sm.update(&session.id)
+            .recipe(Some(rendered))
+            .apply()
+            .await
+            .unwrap();
+
+        let stored = sm.get_session(&session.id, false).await.unwrap();
+        let stored_recipe = stored.recipe.expect("recipe should be stored");
+        assert!(stored_recipe.parameters.is_none());
+        crate::recipe::validate_recipe::validate_recipe_template_from_content(
+            &stored_recipe.to_yaml().unwrap(),
+            None,
+        )
+        .unwrap();
     }
 
     #[tokio::test]

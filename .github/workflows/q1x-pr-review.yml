@@ -62,15 +62,15 @@ jobs:
           test -n "$TRUSTED_REVIEWER_APP_SLUG"
           printf '%s\n' \
             'primary_review_surface=ordinary-chat' \
-            'primary_review_model=gpt-5.6' \
+            'primary_review_model_policy=inherit-ordinary-chat-model' \
             'primary_review_effort=high' \
             'independent_reviewer=goose' \
             'independent_review_provider=ordinary-chat' \
-            'independent_review_model=gpt-5.6' \
+            'independent_review_model_policy=inherit-ordinary-chat-model' \
             'independent_review_effort=high' \
             'semantic_evidence_transport=trusted-github-check-run-attestation' \
             'semantic_commit_status_fallback=false' \
-            'semantic_attestation_schema=q1x.semantic-review-attestation.v1' \
+            'semantic_attestation_schema=q1x.semantic-review-attestation.v2' \
             'codex_semantic_review_authority=false' \
             'work_chat_dependency=false' \
             'codex_cloud_reviewer_dependency=false' \
@@ -112,21 +112,23 @@ jobs:
               exactHead: $head,
               primary: {
                 reviewer: "ordinary-chat",
-                model: "gpt-5.6",
+                modelPolicy: "inherit-ordinary-chat-model",
+                capabilityClass: "deep",
                 effort: "high",
                 requiredCheckRun: "q1x/ordinary-chat-primary"
               },
               independent: {
                 reviewer: "goose",
                 provider: "ordinary-chat",
-                model: "gpt-5.6",
+                modelPolicy: "inherit-ordinary-chat-model",
+                capabilityClass: "deep",
                 effort: "high",
                 requiredCheckRun: "q1x/goose-independent-review",
                 mustFollowPrimary: true,
                 mustBindPrimaryAttestationDigest: true
               },
               attestation: {
-                schema: "q1x.semantic-review-attestation.v1",
+                schema: "q1x.semantic-review-attestation.v2",
                 transport: "github-check-run-output-summary",
                 trustedPublisher: "repository-configured-github-app",
                 digestAlgorithm: "sha256",
@@ -208,15 +210,25 @@ jobs:
                   att = json.loads(summary)
               except json.JSONDecodeError as exc:
                   raise ValueError(f"{expected['stage']}: output.summary is not JSON: {exc}") from exc
+              if not isinstance(att, dict):
+                  raise ValueError(f"{expected['stage']}: attestation must be an object")
+              schema = att.get("schema")
+              if schema == "q1x.semantic-review-attestation.v1":
+                  if att.get("model") != "gpt-5.6" or "modelPolicy" in att or "capabilityClass" in att:
+                      raise ValueError(f"{expected['stage']}: invalid legacy model contract")
+              elif schema == "q1x.semantic-review-attestation.v2":
+                  if (att.get("modelPolicy") != "inherit-ordinary-chat-model"
+                      or att.get("capabilityClass") != "deep" or "model" in att):
+                      raise ValueError(f"{expected['stage']}: invalid inherited model policy")
+              else:
+                  raise ValueError(f"{expected['stage']}: unsupported attestation schema")
               required = {
-                  "schema": "q1x.semantic-review-attestation.v1",
                   "repository": repo,
                   "pullRequestNumber": pr,
                   "exactHead": head,
                   "stage": expected["stage"],
                   "reviewer": expected["reviewer"],
                   "surface": "ordinary-chat",
-                  "model": "gpt-5.6",
                   "effort": "high",
               }
               for key, value in required.items():

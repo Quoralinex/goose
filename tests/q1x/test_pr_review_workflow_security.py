@@ -286,15 +286,20 @@ class Q1XMergeAuthorityTests(unittest.TestCase):
         )
         return shown.stdout
 
-    def test_merge_authority_is_base_controlled_and_sha_pinned(self):
+    def test_evidence_workflow_is_read_only_and_sha_pinned(self):
         caller = (ROOT / ".github/workflows/q1x-goose-review.yml").read_text()
-        self.assertIn("\n  pull_request_target:\n", caller)
-        self.assertNotIn("\n  pull_request:\n", caller)
+        # This workflow publishes no merge decision and holds read-only GitHub
+        # permissions. A historical merge-authority test must not invent write
+        # authority or a pull_request_target requirement for this evidence job.
+        self.assertIn("\n  pull_request:\n", caller)
+        self.assertNotRegex(caller, r"(?m)^\s+(?:contents|pull-requests|checks|statuses):\s+write\s*$")
+        self.assertNotRegex(REVIEW, r"(?m)^\s+(?:contents|pull-requests|checks|statuses):\s+write\s*$")
+        self.assertNotIn("gh pr merge", REVIEW)
         match = re.search(
             r"uses:\s+Quoralinex/goose/\.github/workflows/q1x-pr-review\.yml@([0-9a-f]{40})",
             caller,
         )
-        self.assertIsNotNone(match, "merge-authoritative reusable workflow must use an immutable SHA")
+        self.assertIsNotNone(match, "reusable evidence workflow must use an immutable SHA")
         pinned = self._read_pinned_workflow(match.group(1))
         self.assertEqual(REVIEW, pinned)
         self.assertNotIn("uses: ./.github/workflows/q1x-pr-review.yml", caller)

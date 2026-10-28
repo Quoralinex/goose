@@ -286,18 +286,77 @@ class Q1XMergeAuthorityTests(unittest.TestCase):
         )
         return shown.stdout
 
-    def test_merge_authority_is_base_controlled_and_sha_pinned(self):
+    def test_evidence_workflow_is_read_only_and_sha_pinned(self):
         caller = (ROOT / ".github/workflows/q1x-goose-review.yml").read_text()
-        self.assertIn("\n  pull_request_target:\n", caller)
-        self.assertNotIn("\n  pull_request:\n", caller)
+        # This workflow publishes no merge decision and holds read-only GitHub
+        # permissions. A historical merge-authority test must not invent write
+        # authority or a pull_request_target requirement for this evidence job.
+        self.assertIn("\n  pull_request:\n", caller)
+        readonly_permissions(caller)
+        readonly_permissions(REVIEW)
+        self.assertNotIn("gh pr merge", REVIEW)
         match = re.search(
             r"uses:\s+Quoralinex/goose/\.github/workflows/q1x-pr-review\.yml@([0-9a-f]{40})",
             caller,
         )
-        self.assertIsNotNone(match, "merge-authoritative reusable workflow must use an immutable SHA")
+        self.assertIsNotNone(match, "reusable evidence workflow must use an immutable SHA")
         pinned = self._read_pinned_workflow(match.group(1))
         self.assertEqual(REVIEW, pinned)
         self.assertNotIn("uses: ./.github/workflows/q1x-pr-review.yml", caller)
+
+
+def readonly_permissions(workflow):
+    """Validate every explicit top-level/job permission block, conservatively.
+
+    The supported subset is read-all, {}, or block mappings of read/none.
+    Expressions, YAML aliases/merges and nonempty flow mappings are refused so
+    an unevaluated value cannot silently grant write authority.
+    """
+    lines = workflow.splitlines()
+    headers = []
+    for index, line in enumerate(lines):
+        match = re.fullmatch(r"( *)(?:permissions|'permissions'|\"permissions\")\s*:\s*([^#]*)(?:#.*)?", line)
+        if match: headers.append((index, len(match.group(1)), match.group(2).strip()))
+    if not headers: raise ValueError("Explicit read-only permissions are required")
+    for index, indent, value in headers:
+        if value in ["read-all", "'read-all'", '\"read-all\"', "{}"]: continue
+        if value: raise ValueError("Unsupported or writable permissions value")
+        mapping_indent = None
+        for child in lines[index + 1:]:
+            if not child.strip() or child.lstrip().startswith('#'): continue
+            depth = len(child) - len(child.lstrip(' '))
+            if depth <= indent: break
+            if mapping_indent is None: mapping_indent = depth
+            if depth != mapping_indent or not re.fullmatch(
+                r" *(?:[A-Za-z0-9_-]+|'[A-Za-z0-9_-]+'|\"[A-Za-z0-9_-]+\")\s*:\s*(?:read|none|'read'|'none'|\"read\"|\"none\")\s*(?:#.*)?", child
+            ): raise ValueError("Unsupported or writable permission scope")
+        if mapping_indent is None: raise ValueError("Empty implicit permission block")
+
+
+class Q1XReadonlyPermissionsTests(unittest.TestCase):
+    def test_rejects_every_scope_and_write_all(self):
+        for source in [
+            "permissions: write-all\n", "permissions: 'write-all' # unsafe\n",
+            "permissions:\n  issues: write # unsafe\n", "permissions:\n  id-token: write\n",
+            "permissions:\n  attestations: write\n", 'permissions:\n  "checks": "write"\n',
+            "permissions: {issues: write}\n", "permissions: ${{ inputs.permissions }}\n",
+            "permissions: &allow {contents: write}\n", "permissions: *allow\n",
+            "permissions:\n  <<: *allow\n", "name: implicit default permissions\n",
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError): readonly_permissions(source)
+
+    def test_accepts_explicit_read_and_none_mappings(self):
+        for source in [
+            "permissions: read-all\n", "permissions: {}\n",
+            "permissions:\n  contents: read # checkout\n  issues: none\n",
+            "permissions:\n  'contents': 'read'\njobs:\n  verify:\n    permissions:\n      checks: read\n",
+        ]:
+            with self.subTest(source=source): readonly_permissions(source)
+
+    def test_rejects_write_in_job_override(self):
+        with self.assertRaises(ValueError):
+            readonly_permissions("permissions: read-all\njobs:\n  verify:\n    permissions:\n      packages: write # elevation\n")
 
 
 class Q1XLiveProviderScopeTests(unittest.TestCase):

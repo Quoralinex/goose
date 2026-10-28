@@ -59,4 +59,4 @@ jobs:
           fi
 
       - name: Run Q1X PR review security tests
-        run: python3 tests/q1x/test_pr_review_workflow_security.py
+        run: python3 -m unittest discover -s tests/q1x -p 'test_*.py'

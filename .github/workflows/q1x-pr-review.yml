@@ -212,6 +212,11 @@ jobs:
                   raise ValueError(f"{expected['stage']}: output.summary is not JSON: {exc}") from exc
               if not isinstance(att, dict):
                   raise ValueError(f"{expected['stage']}: attestation must be an object")
+              # The canonical producer binds provider through its reviewer and
+              # surface. Historical records omit provider; any explicit claim
+              # must agree and cannot override that authority.
+              if "provider" in att and att["provider"] != "ordinary-chat":
+                  raise ValueError(f"{expected['stage']}: conflicting provider claim")
               schema = att.get("schema")
               if schema == "q1x.semantic-review-attestation.v1":
                   if att.get("model") != "gpt-5.6" or "modelPolicy" in att or "capabilityClass" in att:

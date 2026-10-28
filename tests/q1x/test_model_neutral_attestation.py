@@ -90,6 +90,33 @@ class ModelNeutralAttestationTests(unittest.TestCase):
                 checks[1]['output']['summary'] = json.dumps(seal(value))
                 self.assertNotEqual(0, self.run_verifier(checks)[0])
 
+    def test_rejects_conflicting_provider_claims_without_rewriting_legacy_records(self):
+        for version in [1, 2]:
+            for stage_index in [0, 1]:
+                for provider in ["anthropic", "codex", "", None, 5]:
+                    with self.subTest(version=version, stage=stage_index, provider=provider):
+                        checks = self.checks(version, version)
+                        value = json.loads(checks[stage_index]['output']['summary'])
+                        value['provider'] = provider
+                        checks[stage_index]['output']['summary'] = json.dumps(seal(value))
+                        if stage_index == 0:
+                            goose = json.loads(checks[1]['output']['summary'])
+                            goose['primaryAttestationDigest'] = value['attestationDigest']
+                            checks[1]['output']['summary'] = json.dumps(seal(goose))
+                        self.assertNotEqual(0, self.run_verifier(checks)[0])
+
+    def test_accepts_consistent_optional_provider_and_current_producer_without_provider(self):
+        for version in [1, 2]:
+            checks = self.checks(version, version)
+            self.assertEqual((0, ''), self.run_verifier(checks))
+            for index in [0, 1]:
+                value = json.loads(checks[index]['output']['summary'])
+                value['provider'] = 'ordinary-chat'
+                if index == 1:
+                    value['primaryAttestationDigest'] = json.loads(checks[0]['output']['summary'])['attestationDigest']
+                checks[index]['output']['summary'] = json.dumps(seal(value))
+            self.assertEqual((0, ''), self.run_verifier(checks))
+
     def test_v2_preserves_authority_and_exact_head_guards(self):
         for field, value in [('surface','work-chat'), ('exactHead','c'*40), ('repository','other/repo'),
                              ('pullRequestNumber',8), ('reviewer','codex'), ('verdict','abstain'),

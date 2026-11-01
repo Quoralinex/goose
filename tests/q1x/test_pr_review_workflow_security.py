@@ -1,4 +1,7 @@
 from pathlib import Path
+import hashlib
+import json
+import os
 import re
 import subprocess
 import tempfile
@@ -52,7 +55,86 @@ class Q1XCheckRunCollectionTests(unittest.TestCase):
         self.assertIn("completed_at must be strictly later than", semantic_source)
 
 
+def run_semantic_verifier(check_payload, existing_result=None):
+    source = textwrap.dedent(extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py"))
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "semantic-check-runs.json").write_text(json.dumps(check_payload))
+        if existing_result is not None:
+            (root / "semantic-review-result.json").write_text(json.dumps(existing_result))
+        completed = subprocess.run(
+            ["python3", "-c", source.replace("/tmp/q1x-review", str(root))],
+            cwd=ROOT, check=False, capture_output=True, text=True,
+            env={**os.environ, "GITHUB_REPOSITORY": "Quoralinex/goose", "PR_NUMBER": "7",
+                 "EXPECTED_HEAD": "0123456789abcdef0123456789abcdef01234567",
+                 "TRUSTED_REVIEWER_APP_ID": "1", "TRUSTED_REVIEWER_APP_SLUG": "q1x-reviewer"},
+        )
+        result_path = root / "semantic-review-result.json"
+        return completed, json.loads(result_path.read_text()) if result_path.exists() else None
+
+
 class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
+    def _attestation(self, stage, reviewer, **extra):
+        payload = {
+            "schema": "q1x.semantic-review-attestation.v2", "repository": "Quoralinex/goose",
+            "pullRequestNumber": 7, "exactHead": "0123456789abcdef0123456789abcdef01234567",
+            "stage": stage, "reviewer": reviewer, "surface": "ordinary-chat",
+            "modelPolicy": "inherit-ordinary-chat-model", "capabilityClass": "deep", "effort": "high",
+            "packetId": f"{stage}-packet", "evidenceDigest": "sha256:" + "1" * 64,
+            "verdict": "pass", **extra,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        payload["attestationDigest"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        return payload
+
+    def _check(self, name, attestation, completed_at, check_id):
+        return {"id": check_id, "name": name, "status": "completed", "conclusion": "success",
+                "head_sha": "0123456789abcdef0123456789abcdef01234567", "completed_at": completed_at,
+                "app": {"id": 1, "slug": "q1x-reviewer"},
+                "output": {"summary": json.dumps(attestation)}}
+
+    def _payload(self, goose_completed="2026-10-01T02:01:00Z", binding=None):
+        primary = self._attestation("ordinary-chat-primary", "ordinary-chat")
+        goose = self._attestation(
+            "goose-independent", "goose", advisoryId="advisory-1",
+            runtimePin="ordinary-chat-inherited-deep",
+            primaryAttestationDigest=binding or primary["attestationDigest"],
+        )
+        return {"check_runs": [
+            self._check("q1x/ordinary-chat-primary", primary, "2026-10-01T02:00:00Z", 1),
+            self._check("q1x/goose-independent-review", goose, goose_completed, 2),
+        ]}
+
+    def test_stale_goose_completion_is_retryable(self):
+        completed, result = run_semantic_verifier(self._payload("2026-10-01T01:59:00Z"))
+        self.assertEqual(2, completed.returncode, completed.stderr)
+        self.assertEqual("causal-provenance-pending", result["state"])
+
+    def test_superseded_primary_binding_is_retryable(self):
+        completed, result = run_semantic_verifier(self._payload(binding="sha256:" + "2" * 64))
+        self.assertEqual(2, completed.returncode, completed.stderr)
+        self.assertIn("binds the accepted primary", result["retryReason"])
+
+    def test_malformed_binding_is_terminal(self):
+        payload = self._payload(binding="invalid")
+        goose_check = payload["check_runs"][1]
+        goose = json.loads(goose_check["output"]["summary"])
+        goose.pop("attestationDigest")
+        encoded = json.dumps(goose, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        goose["attestationDigest"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        goose_check["output"]["summary"] = json.dumps(goose)
+        completed, result = run_semantic_verifier(payload)
+        self.assertEqual(3, completed.returncode, completed.stderr)
+        self.assertEqual("invalid-attestation", result["state"])
+
+    def test_retryable_observation_preserves_prior_terminal_result(self):
+        terminal = {"schema": "q1x.two-stage-semantic-review-result.v2",
+                    "state": "invalid-attestation", "exactHead": "0123456789abcdef0123456789abcdef01234567",
+                    "error": "prior terminal failure"}
+        completed, result = run_semantic_verifier(self._payload("2026-10-01T01:59:00Z"), terminal)
+        self.assertEqual(2, completed.returncode, completed.stderr)
+        self.assertEqual(terminal, result)
+
     def _extract_shell_function(self, name):
         match = re.search(
             rf"          {re.escape(name)}\(\) \{{\n(?P<body>.*?)\n          \}}",

@@ -93,12 +93,12 @@ class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
                 "app": {"id": 1, "slug": "q1x-reviewer"},
                 "output": {"summary": json.dumps(attestation)}}
 
-    def _payload(self, goose_completed="2026-10-01T02:01:00Z", binding=None):
+    def _payload(self, goose_completed="2026-10-01T02:01:00Z", binding=None, goose_verdict="pass"):
         primary = self._attestation("ordinary-chat-primary", "ordinary-chat")
         goose = self._attestation(
             "goose-independent", "goose", advisoryId="advisory-1",
             runtimePin="ordinary-chat-inherited-deep",
-            primaryAttestationDigest=binding or primary["attestationDigest"],
+            primaryAttestationDigest=binding or primary["attestationDigest"], verdict=goose_verdict,
         )
         return {"check_runs": [
             self._check("q1x/ordinary-chat-primary", primary, "2026-10-01T02:00:00Z", 1),
@@ -114,6 +114,34 @@ class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
         completed, result = run_semantic_verifier(self._payload(binding="sha256:" + "2" * 64))
         self.assertEqual(2, completed.returncode, completed.stderr)
         self.assertIn("binds the accepted primary", result["retryReason"])
+
+    def test_stale_goose_non_pass_verdict_remains_terminal(self):
+        completed, result = run_semantic_verifier(
+            self._payload("2026-10-01T01:59:00Z", goose_verdict="findings")
+        )
+        self.assertEqual(3, completed.returncode, completed.stderr)
+        self.assertEqual("invalid-attestation", result["state"])
+
+    def test_exhausted_causal_retry_is_labelled_timeout(self):
+        marker = 'if [ "$state" = \'timeout-pending\' ] && [ -f /tmp/q1x-review/semantic-review-result.json ]'
+        start = REVIEW.index(marker)
+        end = REVIEW.index("            fi", start) + len("            fi")
+        source = textwrap.dedent(REVIEW[start:end])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "semantic-review-result.json"
+            for initial, expected in (
+                ("causal-provenance-pending", "timeout-pending"),
+                ("invalid-attestation", "invalid-attestation"),
+            ):
+                result_path.write_text(json.dumps({"state": initial, "retryReason": "prior causal mismatch"}))
+                completed = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\nstate=timeout-pending\n" + source.replace("/tmp/q1x-review", temp_dir)],
+                    cwd=ROOT, check=False, capture_output=True, text=True,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                result = json.loads(result_path.read_text())
+                self.assertEqual(expected, result["state"])
+                self.assertEqual("prior causal mismatch", result["retryReason"])
 
     def test_malformed_binding_is_terminal(self):
         payload = self._payload(binding="invalid")

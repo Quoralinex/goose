@@ -463,6 +463,12 @@ jobs:
           done
 
           if [ "$result_code" -ne 0 ]; then
+            if [ "$state" = 'timeout-pending' ] && [ -f /tmp/q1x-review/semantic-review-result.json ] && \
+              jq -e '.state == "causal-provenance-pending"' /tmp/q1x-review/semantic-review-result.json >/dev/null 2>&1; then
+              jq '.state = "timeout-pending"' /tmp/q1x-review/semantic-review-result.json \
+                > /tmp/q1x-review/semantic-review-result.tmp
+              mv /tmp/q1x-review/semantic-review-result.tmp /tmp/q1x-review/semantic-review-result.json
+            fi
             if [ ! -f /tmp/q1x-review/semantic-review-result.json ]; then
               jq -n \
                 --arg state "$state" \

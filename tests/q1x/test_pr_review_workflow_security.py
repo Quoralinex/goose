@@ -24,6 +24,31 @@ def extract_embedded_python(target):
 
 
 class Q1XAssuranceClassifierTests(unittest.TestCase):
+    def test_real_codeql_job_names_count_only_from_github_actions(self):
+        source = textwrap.dedent(extract_embedded_python("/tmp/q1x-review/classify_assurance.py"))
+        namespace = {"__name__": "q1x_assurance_test"}
+        exec(source, namespace)
+        matcher = re.search(r"regex='([^']+)'", REVIEW)
+        self.assertIsNotNone(matcher)
+        regex = matcher.group(1)
+        neutral = {"name": "CodeQL", "status": "completed", "conclusion": "neutral"}
+        analysis = {"name": "Analyze (python)", "status": "completed", "conclusion": "success",
+                    "app": {"slug": "github-actions"}}
+        classify = namespace["classify"]
+
+        def state(*checks):
+            return classify({"check_runs": list(checks)}, {"statuses": []}, regex)["state"]
+
+        self.assertEqual(state(neutral), "no-successful-independent-assurance")
+        self.assertEqual(state(neutral, analysis), "completed-clean")
+        self.assertEqual(state(neutral, {**analysis, "app": {"slug": "untrusted-app"}}),
+                         "no-successful-independent-assurance")
+        self.assertEqual(state(neutral, analysis, {"name": "Analyze (rust)", "status": "in_progress",
+                                                   "app": {"slug": "github-actions"}}), "pending")
+        self.assertEqual(state(neutral, analysis, {"name": "Analyze (rust)", "status": "completed",
+                                                   "conclusion": "failure", "app": {"slug": "github-actions"}}),
+                         "adverse")
+
     def test_workflow_owns_single_classifier_and_runs_deterministic_self_tests(self):
         source = extract_embedded_python("/tmp/q1x-review/classify_assurance.py")
         self.assertIn("def classify(check_payload, status_payload, regex, require=True):", source)

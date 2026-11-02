@@ -490,7 +490,7 @@ jobs:
           REQUIRE_ASSURANCE: ${{ inputs.require_independent_assurance }}
         run: |
           set -euo pipefail
-          regex='circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security'
+          regex='circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security|^Analyze \((actions|javascript-typescript|python|rust)\)$'
           result_code=1
           state='unknown'
 
@@ -516,6 +516,10 @@ jobs:
                   check
                   for check in check_payload.get("check_runs", [])
                   if matcher.search(check.get("name") or "")
+                  and (
+                      not re.fullmatch(r"Analyze \((actions|javascript-typescript|python|rust)\)", check.get("name") or "", re.IGNORECASE)
+                      or (check.get("app") or {}).get("slug") == "github-actions"
+                  )
               ]
               statuses = [
                   status

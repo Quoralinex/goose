@@ -41,9 +41,14 @@ class Q1XAssuranceClassifierTests(unittest.TestCase):
         classify = namespace["classify"]
 
         def state(*checks, observed_run=run, statuses=()):
+            def lookup(run_id, repository):
+                self.assertEqual(run_id, 7)
+                self.assertEqual(repository, "Quoralinex/goose")
+                return observed_run
+
             return classify({"check_runs": list(checks)}, {"statuses": list(statuses)}, regex,
                             repo="Quoralinex/goose", head=head,
-                            run_lookup=lambda _run_id, _repo: observed_run)["state"]
+                            run_lookup=lookup)["state"]
 
         self.assertEqual(state(neutral), "no-configured-independent-assurance")
         for publisher in ("github-actions", "untrusted-app"):
@@ -57,6 +62,13 @@ class Q1XAssuranceClassifierTests(unittest.TestCase):
         self.assertEqual(state(neutral, analysis, observed_run={**run, "path": ".github/workflows/fake.yml"}),
                          "no-configured-independent-assurance")
         self.assertEqual(state(neutral, analysis, observed_run={**run, "head_sha": "f" * 40}),
+                         "no-configured-independent-assurance")
+        self.assertEqual(state(neutral, analysis, observed_run={**run, "id": 8}),
+                         "no-configured-independent-assurance")
+        self.assertEqual(state(neutral, analysis,
+                               observed_run={**run, "repository": {"full_name": "Quoralinex/other"}}),
+                         "no-configured-independent-assurance")
+        self.assertEqual(state(neutral, analysis, observed_run={**run, "event": "pull_request"}),
                          "no-configured-independent-assurance")
         self.assertEqual(state(neutral, analysis, {"name": "Analyze (rust)", "status": "in_progress",
                                                    "app": {"slug": "github-actions"}, "id": 43,

@@ -311,6 +311,33 @@ class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
         self.assertIsNotNone(match, f"{name} helper function is missing")
         return f"{name}() {{\n" + textwrap.dedent(match.group("body")) + "\n}"
 
+    def test_semantic_collection_includes_superseded_primary_runs(self):
+        earlier = self._attestation("ordinary-chat-primary", "ordinary-chat", packetId="earlier-primary")
+        payload = self._payload(binding=earlier["attestationDigest"])
+        payload["check_runs"].insert(0, self._check(
+            "q1x/ordinary-chat-primary", earlier, "2026-10-01T01:58:00Z", 0,
+        ))
+        collection = self._extract_shell_function("collect_check_runs")
+        script = "\n".join([
+            "set -euo pipefail",
+            'gh() { if [[ "$*" == *"filter=all"* ]]; then printf "%s\\n" "$Q1X_TEST_ALL_RUNS"; else printf "%s\\n" "$Q1X_TEST_LATEST_RUNS"; fi; }',
+            collection,
+            "collect_check_runs",
+        ])
+        completed = subprocess.run(
+            ["bash", "-c", script], cwd=ROOT, check=False, capture_output=True, text=True,
+            env={**os.environ, "GITHUB_REPOSITORY": "Quoralinex/goose",
+                 "EXPECTED_HEAD": "0123456789abcdef0123456789abcdef01234567",
+                 "Q1X_TEST_ALL_RUNS": json.dumps([payload]),
+                 "Q1X_TEST_LATEST_RUNS": json.dumps([{"check_runs": payload["check_runs"][1:]}])},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        collected = json.loads(completed.stdout)
+        self.assertEqual([0, 1, 2], [item["id"] for item in collected["check_runs"]])
+        verified, result = run_semantic_verifier(collected)
+        self.assertEqual(2, verified.returncode, verified.stderr)
+        self.assertEqual("causal-provenance-pending", result["state"])
+
     def test_transient_semantic_collection_failure_is_retryable(self):
         self.assertIn("for attempt in $(seq 1 61); do", REVIEW)
         self.assertIn('if ! collect_check_runs > "$semantic_check_runs_tmp"; then', REVIEW)

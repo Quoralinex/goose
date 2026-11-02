@@ -427,7 +427,7 @@ jobs:
 
           collect_check_runs() {
             gh api --paginate --slurp -H 'Accept: application/vnd.github+json' \
-              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
+              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100&filter=all" \
               | jq '{check_runs: [.[].check_runs[]]}'
           }
 

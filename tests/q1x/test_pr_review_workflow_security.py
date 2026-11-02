@@ -215,9 +215,34 @@ class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
         self.assertEqual("causal-provenance-pending", result["state"])
 
     def test_superseded_primary_binding_is_retryable(self):
-        completed, result = run_semantic_verifier(self._payload(binding="sha256:" + "2" * 64))
+        earlier = self._attestation("ordinary-chat-primary", "ordinary-chat", packetId="earlier-primary")
+        payload = self._payload(binding=earlier["attestationDigest"])
+        payload["check_runs"].insert(0, self._check(
+            "q1x/ordinary-chat-primary", earlier, "2026-10-01T01:58:00Z", 0,
+        ))
+        completed, result = run_semantic_verifier(payload)
         self.assertEqual(2, completed.returncode, completed.stderr)
         self.assertIn("binds the accepted primary", result["retryReason"])
+
+    def test_unknown_primary_binding_is_terminal(self):
+        completed, metrics, result = self._run_semantic_retry_loop([
+            self._payload(binding="sha256:" + "2" * 64), self._payload(),
+        ])
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(["1", "1", "invalid-attestation", "1"], metrics)
+        self.assertIn("known superseded primary", result["error"])
+
+    def test_nonpassing_older_primary_cannot_justify_retry(self):
+        earlier = self._attestation(
+            "ordinary-chat-primary", "ordinary-chat", packetId="earlier-primary", verdict="findings",
+        )
+        payload = self._payload(binding=earlier["attestationDigest"])
+        payload["check_runs"].insert(0, self._check(
+            "q1x/ordinary-chat-primary", earlier, "2026-10-01T01:58:00Z", 0,
+        ))
+        completed, result = run_semantic_verifier(payload)
+        self.assertEqual(3, completed.returncode, completed.stderr)
+        self.assertEqual("invalid-attestation", result["state"])
 
     def test_stale_goose_non_pass_verdict_remains_terminal(self):
         completed, result = run_semantic_verifier(

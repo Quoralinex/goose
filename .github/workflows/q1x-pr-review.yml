@@ -263,6 +263,32 @@ jobs:
                   raise ValueError(f"{expected['stage']}: invalid verdict {att['verdict']!r}")
               return att
 
+          def known_superseded_primary_binding(checks, accepted_check, binding):
+              for candidate in checks:
+                  app = candidate.get("app") or {}
+                  if (
+                      candidate.get("id") == accepted_check.get("id")
+                      or candidate.get("name") != "q1x/ordinary-chat-primary"
+                      or candidate.get("status") != "completed"
+                      or candidate.get("conclusion") != "success"
+                      or candidate.get("head_sha") != head
+                      or str(app.get("id")) != app_id
+                      or app.get("slug") != app_slug
+                      or not candidate.get("completed_at")
+                      or candidate["completed_at"] >= accepted_check["completed_at"]
+                  ):
+                      continue
+                  try:
+                      earlier = parse_attestation(
+                          candidate,
+                          {"stage": "ordinary-chat-primary", "reviewer": "ordinary-chat"},
+                      )
+                  except ValueError:
+                      continue
+                  if earlier["verdict"] == "pass" and earlier["attestationDigest"] == binding:
+                      return True
+              return False
+
           if OUT.exists():
               try:
                   existing_result = json.loads(OUT.read_text())
@@ -318,15 +344,20 @@ jobs:
               for key in ("advisoryId", "runtimePin"):
                   if not isinstance(goose.get(key), str) or not goose[key]:
                       raise ValueError(f"goose-independent: missing governed Goose {key}")
+              if primary_binding != primary["attestationDigest"]:
+                  if known_superseded_primary_binding(checks, primary_check, primary_binding):
+                      raise RetryableCausalEvidence(
+                          "goose-independent: waiting for provenance that binds "
+                          "the accepted primary attestation"
+                      )
+                  raise ValueError(
+                      "goose-independent: primaryAttestationDigest does not bind the accepted "
+                      "or a known superseded primary attestation"
+                  )
               if goose_completed <= primary_completed:
                   raise RetryableCausalEvidence(
                       "goose-independent: completed_at must be strictly later than "
                       "ordinary-chat-primary completed_at; waiting for refreshed causal provenance"
-                  )
-              if primary_binding != primary["attestationDigest"]:
-                  raise RetryableCausalEvidence(
-                      "goose-independent: waiting for provenance that binds "
-                      "the accepted primary attestation"
                   )
 
               PRIMARY.write_text(json.dumps(primary, sort_keys=True, indent=2) + "\n")

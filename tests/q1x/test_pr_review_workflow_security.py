@@ -105,6 +105,55 @@ class Q1XSemanticAttestationResilienceTests(unittest.TestCase):
             self._check("q1x/goose-independent-review", goose, goose_completed, 2),
         ]}
 
+    def _run_semantic_retry_loop(self, snapshots):
+        marker = "          result_code=1\n          state='timeout-pending'\n          for attempt in $(seq 1 61); do"
+        start = REVIEW.index(marker)
+        end = REVIEW.index("\n          done", start) + len("\n          done")
+        verifier = textwrap.dedent(extract_embedded_python("/tmp/q1x-review/verify_semantic_attestations.py"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "verify_semantic_attestations.py").write_text(verifier.replace("/tmp/q1x-review", temp_dir))
+            for number, snapshot in enumerate(snapshots, 1):
+                (root / f"snapshot-{number}.json").write_text(json.dumps(snapshot))
+            loop = textwrap.dedent(REVIEW[start:end]).replace("/tmp/q1x-review", temp_dir)
+            script = "\n".join([
+                "set -euo pipefail",
+                "collections=0",
+                "verifications=0",
+                'collect_check_runs() { collections=$((collections + 1)); cat "$Q1X_TEST_FIXTURE_DIR/snapshot-$collections.json"; }',
+                "retry_semantic_collection_failure() { return 1; }",
+                "sleep() { :; }",
+                'python3() { verifications=$((verifications + 1)); command python3 "$@"; }',
+                loop,
+                'printf "%s %s %s %s\\n" "$collections" "$verifications" "$state" "$result_code" > "$Q1X_TEST_FIXTURE_DIR/metrics"',
+            ])
+            completed = subprocess.run(
+                ["bash", "-c", script], cwd=ROOT, check=False, capture_output=True, text=True,
+                env={**os.environ, "Q1X_TEST_FIXTURE_DIR": temp_dir,
+                     "GITHUB_REPOSITORY": "Quoralinex/goose", "PR_NUMBER": "7",
+                     "EXPECTED_HEAD": "0123456789abcdef0123456789abcdef01234567",
+                     "TRUSTED_REVIEWER_APP_ID": "1", "TRUSTED_REVIEWER_APP_SLUG": "q1x-reviewer"},
+            )
+            metrics = (root / "metrics").read_text().split() if (root / "metrics").exists() else []
+            result = json.loads((root / "semantic-review-result.json").read_text()) if (root / "semantic-review-result.json").exists() else None
+            return completed, metrics, result
+
+    def test_retry_loop_recollects_and_accepts_fresh_causal_attestation(self):
+        completed, metrics, result = self._run_semantic_retry_loop([
+            self._payload("2026-10-01T01:59:00Z"), self._payload(),
+        ])
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(["2", "2", "completed-clean", "0"], metrics)
+        self.assertEqual("completed-clean", result["state"])
+
+    def test_retry_loop_stops_on_terminal_invalid_attestation(self):
+        completed, metrics, result = self._run_semantic_retry_loop([
+            self._payload("2026-10-01T01:59:00Z", goose_verdict="findings"), self._payload(),
+        ])
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(["1", "1", "invalid-attestation", "1"], metrics)
+        self.assertEqual("invalid-attestation", result["state"])
+
     def test_stale_goose_completion_is_retryable(self):
         completed, result = run_semantic_verifier(self._payload("2026-10-01T01:59:00Z"))
         self.assertEqual(2, completed.returncode, completed.stderr)

@@ -491,7 +491,7 @@ jobs:
           REQUIRE_ASSURANCE: ${{ inputs.require_independent_assurance }}
         run: |
           set -euo pipefail
-          regex='circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security|^Analyze \((actions|javascript-typescript|python|rust)\)$'
+          regex='circleci|semgrep|trivy|gitleaks|sonar|snyk|codecov|security|^Analyze \((actions|javascript-typescript|python|rust)\)$'
           result_code=1
           state='unknown'
 

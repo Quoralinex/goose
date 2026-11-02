@@ -40,19 +40,24 @@ class Q1XAssuranceClassifierTests(unittest.TestCase):
                     "details_url": "https://github.com/Quoralinex/goose/actions/runs/7/job/42"}
         classify = namespace["classify"]
 
-        def state(*checks, observed_run=run):
-            return classify({"check_runs": list(checks)}, {"statuses": []}, regex,
+        def state(*checks, observed_run=run, statuses=()):
+            return classify({"check_runs": list(checks)}, {"statuses": list(statuses)}, regex,
                             repo="Quoralinex/goose", head=head,
                             run_lookup=lambda _run_id, _repo: observed_run)["state"]
 
-        self.assertEqual(state(neutral), "no-successful-independent-assurance")
+        self.assertEqual(state(neutral), "no-configured-independent-assurance")
+        for publisher in ("github-actions", "untrusted-app"):
+            plain_success = {**neutral, "conclusion": "success", "app": {"slug": publisher}}
+            self.assertEqual(state(plain_success), "no-configured-independent-assurance")
+        self.assertEqual(state(statuses=[{"context": "CodeQL", "state": "success"}]),
+                         "no-configured-independent-assurance")
         self.assertEqual(state(neutral, analysis), "completed-clean")
         self.assertEqual(state(neutral, {**analysis, "app": {"slug": "untrusted-app"}}),
-                         "no-successful-independent-assurance")
+                         "no-configured-independent-assurance")
         self.assertEqual(state(neutral, analysis, observed_run={**run, "path": ".github/workflows/fake.yml"}),
-                         "no-successful-independent-assurance")
+                         "no-configured-independent-assurance")
         self.assertEqual(state(neutral, analysis, observed_run={**run, "head_sha": "f" * 40}),
-                         "no-successful-independent-assurance")
+                         "no-configured-independent-assurance")
         self.assertEqual(state(neutral, analysis, {"name": "Analyze (rust)", "status": "in_progress",
                                                    "app": {"slug": "github-actions"}, "id": 43,
                                                    "details_url": "https://github.com/Quoralinex/goose/actions/runs/7/job/43"}),

@@ -275,7 +275,8 @@ jobs:
                       or str(app.get("id")) != app_id
                       or app.get("slug") != app_slug
                       or not candidate.get("completed_at")
-                      or candidate["completed_at"] >= accepted_check["completed_at"]
+                      or (candidate["completed_at"], candidate.get("id") or 0)
+                      >= (accepted_check["completed_at"], accepted_check.get("id") or 0)
                   ):
                       continue
                   try:

@@ -31,27 +31,40 @@ class Q1XAssuranceClassifierTests(unittest.TestCase):
         matcher = re.search(r"regex='([^']+)'", REVIEW)
         self.assertIsNotNone(matcher)
         regex = matcher.group(1)
+        head = "0123456789abcdef0123456789abcdef01234567"
+        run = {"id": 7, "path": "dynamic/github-code-scanning/codeql", "event": "dynamic",
+               "head_sha": head, "repository": {"full_name": "Quoralinex/goose"}}
         neutral = {"name": "CodeQL", "status": "completed", "conclusion": "neutral"}
         analysis = {"name": "Analyze (python)", "status": "completed", "conclusion": "success",
-                    "app": {"slug": "github-actions"}}
+                    "app": {"slug": "github-actions"}, "id": 42,
+                    "details_url": "https://github.com/Quoralinex/goose/actions/runs/7/job/42"}
         classify = namespace["classify"]
 
-        def state(*checks):
-            return classify({"check_runs": list(checks)}, {"statuses": []}, regex)["state"]
+        def state(*checks, observed_run=run):
+            return classify({"check_runs": list(checks)}, {"statuses": []}, regex,
+                            repo="Quoralinex/goose", head=head,
+                            run_lookup=lambda _run_id, _repo: observed_run)["state"]
 
         self.assertEqual(state(neutral), "no-successful-independent-assurance")
         self.assertEqual(state(neutral, analysis), "completed-clean")
         self.assertEqual(state(neutral, {**analysis, "app": {"slug": "untrusted-app"}}),
                          "no-successful-independent-assurance")
+        self.assertEqual(state(neutral, analysis, observed_run={**run, "path": ".github/workflows/fake.yml"}),
+                         "no-successful-independent-assurance")
+        self.assertEqual(state(neutral, analysis, observed_run={**run, "head_sha": "f" * 40}),
+                         "no-successful-independent-assurance")
         self.assertEqual(state(neutral, analysis, {"name": "Analyze (rust)", "status": "in_progress",
-                                                   "app": {"slug": "github-actions"}}), "pending")
+                                                   "app": {"slug": "github-actions"}, "id": 43,
+                                                   "details_url": "https://github.com/Quoralinex/goose/actions/runs/7/job/43"}),
+                         "pending")
         self.assertEqual(state(neutral, analysis, {"name": "Analyze (rust)", "status": "completed",
-                                                   "conclusion": "failure", "app": {"slug": "github-actions"}}),
+                                                   "conclusion": "failure", "app": {"slug": "github-actions"},
+                                                   "id": 43, "details_url": "https://github.com/Quoralinex/goose/actions/runs/7/job/43"}),
                          "adverse")
 
     def test_workflow_owns_single_classifier_and_runs_deterministic_self_tests(self):
         source = extract_embedded_python("/tmp/q1x-review/classify_assurance.py")
-        self.assertIn("def classify(check_payload, status_payload, regex, require=True):", source)
+        self.assertIn("def classify(check_payload, status_payload, regex, require=True,", source)
         self.assertIn("def self_test():", source)
         for state in (
             "no-configured-independent-assurance",

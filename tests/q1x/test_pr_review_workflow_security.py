@@ -498,6 +498,14 @@ class Q1XMergeAuthorityTests(unittest.TestCase):
         readonly_permissions(REVIEW)
         self.assertIn("\n  actions: read\n", caller)
         self.assertIn("\n      actions: read\n", REVIEW)
+        caller_block = re.search(r"(?m)^permissions:\n((?:  [a-z-]+: read\n)+)", caller)
+        called_block = re.search(r"(?m)^    permissions:\n((?:      [a-z-]+: read\n)+)", REVIEW)
+        self.assertIsNotNone(caller_block)
+        self.assertIsNotNone(called_block)
+        caller_scopes = set(re.findall(r"(?m)^  ([a-z-]+): read$", caller_block.group(1)))
+        called_scopes = set(re.findall(r"(?m)^      ([a-z-]+): read$", called_block.group(1)))
+        self.assertTrue(called_scopes <= caller_scopes,
+                        f"called workflow requests scopes absent from caller: {called_scopes - caller_scopes}")
         self.assertNotIn("gh pr merge", REVIEW)
         match = re.search(
             r"uses:\s+Quoralinex/goose/\.github/workflows/q1x-pr-review\.yml@([0-9a-f]{40})",

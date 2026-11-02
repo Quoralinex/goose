@@ -86,6 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
+      actions: read
       contents: read
       pull-requests: read
       checks: read
@@ -169,6 +170,9 @@ jobs:
           head = os.environ["EXPECTED_HEAD"]
           app_id = str(os.environ["TRUSTED_REVIEWER_APP_ID"])
           app_slug = os.environ["TRUSTED_REVIEWER_APP_SLUG"]
+
+          class RetryableCausalEvidence(Exception):
+              pass
 
           def canonical_digest(payload):
               body = dict(payload)
@@ -259,6 +263,47 @@ jobs:
                   raise ValueError(f"{expected['stage']}: invalid verdict {att['verdict']!r}")
               return att
 
+          def known_superseded_primary_binding(checks, accepted_check, binding):
+              for candidate in checks:
+                  app = candidate.get("app") or {}
+                  if (
+                      candidate.get("id") == accepted_check.get("id")
+                      or candidate.get("name") != "q1x/ordinary-chat-primary"
+                      or candidate.get("status") != "completed"
+                      or candidate.get("conclusion") != "success"
+                      or candidate.get("head_sha") != head
+                      or str(app.get("id")) != app_id
+                      or app.get("slug") != app_slug
+                      or not candidate.get("completed_at")
+                      or (candidate["completed_at"], candidate.get("id") or 0)
+                      >= (accepted_check["completed_at"], accepted_check.get("id") or 0)
+                  ):
+                      continue
+                  try:
+                      earlier = parse_attestation(
+                          candidate,
+                          {"stage": "ordinary-chat-primary", "reviewer": "ordinary-chat"},
+                      )
+                  except ValueError:
+                      continue
+                  if earlier["verdict"] == "pass" and earlier["attestationDigest"] == binding:
+                      return True
+              return False
+
+          if OUT.exists():
+              try:
+                  existing_result = json.loads(OUT.read_text())
+              except (json.JSONDecodeError, OSError):
+                  OUT.unlink(missing_ok=True)
+              else:
+                  preserve_terminal = (
+                      existing_result.get("schema") == "q1x.two-stage-semantic-review-result.v2"
+                      and existing_result.get("state") == "invalid-attestation"
+                      and existing_result.get("exactHead") == head
+                  )
+                  if not preserve_terminal:
+                      OUT.unlink(missing_ok=True)
+
           payload = json.loads(CHECKS.read_text())
           checks = payload.get("check_runs") or []
           primary_check = select_check(checks, "q1x/ordinary-chat-primary")
@@ -284,11 +329,6 @@ jobs:
               goose_completed = goose_check.get("completed_at")
               if not primary_completed or not goose_completed:
                   raise ValueError("trusted semantic checks must both include completed_at")
-              if goose_completed <= primary_completed:
-                  raise ValueError(
-                      "goose-independent: completed_at must be strictly later than "
-                      "ordinary-chat-primary completed_at"
-                  )
               if primary["verdict"] != "pass":
                   raise ValueError(
                       f"ordinary-chat-primary: direct verdict is {primary['verdict']!r}, not pass"
@@ -297,14 +337,29 @@ jobs:
                   raise ValueError(
                       f"goose-independent: direct verdict is {goose['verdict']!r}, not pass"
                   )
-              if goose.get("primaryAttestationDigest") != primary["attestationDigest"]:
-                  raise ValueError(
-                      "goose-independent: primaryAttestationDigest does not bind "
-                      "the accepted primary attestation"
-                  )
+              primary_binding = goose.get("primaryAttestationDigest")
+              if not isinstance(primary_binding, str) or not re.fullmatch(
+                  r"sha256:[0-9a-f]{64}", primary_binding
+              ):
+                  raise ValueError("goose-independent: invalid primaryAttestationDigest")
               for key in ("advisoryId", "runtimePin"):
                   if not isinstance(goose.get(key), str) or not goose[key]:
                       raise ValueError(f"goose-independent: missing governed Goose {key}")
+              if primary_binding != primary["attestationDigest"]:
+                  if known_superseded_primary_binding(checks, primary_check, primary_binding):
+                      raise RetryableCausalEvidence(
+                          "goose-independent: waiting for provenance that binds "
+                          "the accepted primary attestation"
+                      )
+                  raise ValueError(
+                      "goose-independent: primaryAttestationDigest does not bind the accepted "
+                      "or a known superseded primary attestation"
+                  )
+              if goose_completed <= primary_completed:
+                  raise RetryableCausalEvidence(
+                      "goose-independent: completed_at must be strictly later than "
+                      "ordinary-chat-primary completed_at; waiting for refreshed causal provenance"
+                  )
 
               PRIMARY.write_text(json.dumps(primary, sort_keys=True, indent=2) + "\n")
               GOOSE.write_text(json.dumps(goose, sort_keys=True, indent=2) + "\n")
@@ -337,6 +392,27 @@ jobs:
                   },
               }
               OUT.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+          except RetryableCausalEvidence as exc:
+              preserve_terminal = False
+              if OUT.exists():
+                  try:
+                      existing_result = json.loads(OUT.read_text())
+                  except (json.JSONDecodeError, OSError):
+                      existing_result = {}
+                  preserve_terminal = (
+                      existing_result.get("schema") == "q1x.two-stage-semantic-review-result.v2"
+                      and existing_result.get("state") == "invalid-attestation"
+                      and existing_result.get("exactHead") == head
+                  )
+              if not preserve_terminal:
+                  OUT.write_text(json.dumps({
+                      "schema": "q1x.two-stage-semantic-review-result.v2",
+                      "state": "causal-provenance-pending",
+                      "exactHead": head,
+                      "retryReason": str(exc),
+                  }, sort_keys=True, indent=2) + "\n")
+              print(str(exc), file=sys.stderr)
+              sys.exit(2)
           except ValueError as exc:
               result = {
                   "schema": "q1x.two-stage-semantic-review-result.v2",
@@ -351,7 +427,7 @@ jobs:
 
           collect_check_runs() {
             gh api --paginate --slurp -H 'Accept: application/vnd.github+json' \
-              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100" \
+              "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD/check-runs?per_page=100&filter=all" \
               | jq '{check_runs: [.[].check_runs[]]}'
           }
 
@@ -420,6 +496,12 @@ jobs:
           done
 
           if [ "$result_code" -ne 0 ]; then
+            if [ "$state" = 'timeout-pending' ] && [ -f /tmp/q1x-review/semantic-review-result.json ] && \
+              jq -e '.state == "causal-provenance-pending"' /tmp/q1x-review/semantic-review-result.json >/dev/null 2>&1; then
+              jq '.state = "timeout-pending"' /tmp/q1x-review/semantic-review-result.json \
+                > /tmp/q1x-review/semantic-review-result.tmp
+              mv /tmp/q1x-review/semantic-review-result.tmp /tmp/q1x-review/semantic-review-result.json
+            fi
             if [ ! -f /tmp/q1x-review/semantic-review-result.json ]; then
               jq -n \
                 --arg state "$state" \
@@ -441,13 +523,15 @@ jobs:
           REQUIRE_ASSURANCE: ${{ inputs.require_independent_assurance }}
         run: |
           set -euo pipefail
-          regex='circleci|codeql|semgrep|trivy|gitleaks|sonar|snyk|codecov|security'
+          regex='circleci|semgrep|trivy|gitleaks|sonar|snyk|codecov|security|^Analyze \((actions|javascript-typescript|python|rust)\)$'
           result_code=1
           state='unknown'
 
           cat > /tmp/q1x-review/classify_assurance.py <<'PY'
           import json
+          import os
           import re
+          import subprocess
           import sys
           from pathlib import Path
 
@@ -461,12 +545,56 @@ jobs:
           }
           ADVERSE_STATUS_STATES = {"failure", "error"}
 
-          def classify(check_payload, status_payload, regex, require=True):
+          def load_codeql_run(run_id, repo):
+              completed = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
+                  capture_output=True, text=True, check=False,
+              )
+              if completed.returncode != 0:
+                  raise RuntimeError(f"CodeQL workflow provenance lookup failed for run {run_id}")
+              return json.loads(completed.stdout)
+
+          def trusted_codeql_analysis(check, repo, head, run_lookup):
+              name = check.get("name") or ""
+              if not re.fullmatch(r"Analyze \((actions|javascript-typescript|python|rust)\)", name, re.IGNORECASE):
+                  return True
+              if not repo or not head or (check.get("app") or {}).get("slug") != "github-actions":
+                  return False
+              match = re.fullmatch(
+                  rf"https://github\.com/{re.escape(repo)}/actions/runs/([0-9]+)/job/([0-9]+)",
+                  check.get("details_url") or "",
+              )
+              if not match or str(check.get("id")) != match.group(2):
+                  return False
+              run_id = int(match.group(1))
+              run = run_lookup(run_id, repo)
+              return (
+                  run.get("id") == run_id
+                  and run.get("path") == "dynamic/github-code-scanning/codeql"
+                  and run.get("event") == "dynamic"
+                  and run.get("head_sha") == head
+                  and (run.get("repository") or {}).get("full_name") == repo
+              )
+
+          def classify(check_payload, status_payload, regex, require=True,
+                       repo=None, head=None, run_lookup=None):
               matcher = re.compile(regex, re.IGNORECASE)
+              repo = repo or os.environ.get("GITHUB_REPOSITORY")
+              head = head or os.environ.get("EXPECTED_HEAD")
+              lookup = run_lookup or load_codeql_run
+              run_cache = {}
+
+              def cached_run_lookup(run_id, repository):
+                  key = (repository, run_id)
+                  if key not in run_cache:
+                      run_cache[key] = lookup(run_id, repository)
+                  return run_cache[key]
+
               checks = [
                   check
                   for check in check_payload.get("check_runs", [])
                   if matcher.search(check.get("name") or "")
+                  and trusted_codeql_analysis(check, repo, head, cached_run_lookup)
               ]
               statuses = [
                   status

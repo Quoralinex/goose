@@ -496,6 +496,8 @@ class Q1XMergeAuthorityTests(unittest.TestCase):
         self.assertIn("\n  pull_request:\n", caller)
         readonly_permissions(caller)
         readonly_permissions(REVIEW)
+        self.assertIn("\n  actions: read\n", caller)
+        self.assertIn("\n      actions: read\n", REVIEW)
         self.assertNotIn("gh pr merge", REVIEW)
         match = re.search(
             r"uses:\s+Quoralinex/goose/\.github/workflows/q1x-pr-review\.yml@([0-9a-f]{40})",

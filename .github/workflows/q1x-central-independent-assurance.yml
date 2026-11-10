@@ -2,6 +2,7 @@ name: Q1X Central Independent Assurance
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
   merge_group:
 
 permissions:
@@ -9,6 +10,7 @@ permissions:
 
 jobs:
   secret-scan:
+    name: Gitleaks Secret Scan
     # Required for organization ruleset execution across repositories.
     if: true
     runs-on: ubuntu-latest
@@ -63,6 +65,11 @@ jobs:
             ignored_repo_file="$(mktemp -d "$RUNNER_TEMP/q1x-gitleaks-ignore.XXXXXX")/.gitleaksignore"
             mv -- "$repo_ignore" "$ignored_repo_file"
             trap 'mv -- "$ignored_repo_file" "$repo_ignore"' EXIT
+          fi
+          if ! git log -p -U0 --text -m --no-ext-diff --no-textconv "$COMMIT_RANGE" \
+            | awk '/^\+(version https:\/\/git-lfs\.github\.com\/spec\/v1|oid sha256:[0-9a-f]{64})$/ { found=1 } END { exit found ? 1 : 0 }'; then
+            echo 'Changed Git LFS pointers require separate content scanning; failing closed.' >&2
+            exit 1
           fi
           "$RUNNER_TEMP/gitleaks" git . \
             --log-opts "--text -m --no-ext-diff --no-textconv $COMMIT_RANGE" \

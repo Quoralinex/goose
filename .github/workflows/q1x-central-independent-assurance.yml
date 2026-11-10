@@ -58,6 +58,12 @@ jobs:
           set -euo pipefail
           printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/q1x-gitleaks.toml"
           : > "$RUNNER_TEMP/q1x-gitleaks-ignore"
+          repo_ignore="$PWD/.gitleaksignore"
+          if [[ -e "$repo_ignore" || -L "$repo_ignore" ]]; then
+            ignored_repo_file="$(mktemp -d "$RUNNER_TEMP/q1x-gitleaks-ignore.XXXXXX")/.gitleaksignore"
+            mv -- "$repo_ignore" "$ignored_repo_file"
+            trap 'mv -- "$ignored_repo_file" "$repo_ignore"' EXIT
+          fi
           "$RUNNER_TEMP/gitleaks" git . \
             --log-opts "$COMMIT_RANGE" \
             --config "$RUNNER_TEMP/q1x-gitleaks.toml" \

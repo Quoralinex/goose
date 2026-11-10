@@ -65,7 +65,7 @@ jobs:
             trap 'mv -- "$ignored_repo_file" "$repo_ignore"' EXIT
           fi
           "$RUNNER_TEMP/gitleaks" git . \
-            --log-opts "$COMMIT_RANGE" \
+            --log-opts "--text -m --no-ext-diff --no-textconv $COMMIT_RANGE" \
             --config "$RUNNER_TEMP/q1x-gitleaks.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/q1x-gitleaks-ignore" \
             --ignore-gitleaks-allow \

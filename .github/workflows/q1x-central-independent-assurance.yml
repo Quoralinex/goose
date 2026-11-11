@@ -31,8 +31,7 @@ jobs:
           verifier="$RUNNER_TEMP/q1x-verify-proposal.sh"
           cat > "$verifier" <<'VERIFY'
           set -euo pipefail
-          # A PR target may advance without a new PR event. The immutable event
-          # base still gives a conservative scan range for the exact head.
+          # Only descendant target updates preserve the immutable scan range.
           if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
             number="$(jq -er '.pull_request.number' "$GITHUB_EVENT_PATH")"
             [[ "$number" =~ ^[1-9][0-9]*$ ]]
@@ -42,6 +41,17 @@ jobs:
               .base.ref == $event[0].pull_request.base.ref and
               .base.repo.full_name == $repo
             ' "$RUNNER_TEMP/q1x-live-proposal.json" > /dev/null
+            event_base="$(jq -er '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
+            live_base="$(jq -er '.base.sha' "$RUNNER_TEMP/q1x-live-proposal.json")"
+            [[ "$event_base" =~ ^[0-9a-f]{40}$ && "$live_base" =~ ^[0-9a-f]{40}$ ]]
+            if [[ "$live_base" != "$event_base" ]]; then
+              gh api "repos/$GITHUB_REPOSITORY/compare/$event_base...$live_base" \
+                > "$RUNNER_TEMP/q1x-base-ancestry.json"
+              jq -e --arg base "$event_base" '
+                (.status == "ahead" or .status == "identical") and
+                .base_commit.sha == $base and .merge_base_commit.sha == $base
+              ' "$RUNNER_TEMP/q1x-base-ancestry.json" > /dev/null
+            fi
           elif [[ "$GITHUB_EVENT_NAME" == merge_group ]]; then
             base_branch="$(jq -er '.merge_group.base_ref | select(startswith("refs/heads/")) | ltrimstr("refs/heads/") | select(length > 0)' "$GITHUB_EVENT_PATH")"
             base_ref="$(printf '%s' "$base_branch" | jq -sRr @uri)"

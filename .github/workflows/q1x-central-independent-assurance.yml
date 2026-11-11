@@ -31,20 +31,20 @@ jobs:
           verifier="$RUNNER_TEMP/q1x-verify-proposal.sh"
           cat > "$verifier" <<'VERIFY'
           set -euo pipefail
-          default_branch="$(jq -er '.repository.default_branch' "$GITHUB_EVENT_PATH")"
+          # A PR target may advance without a new PR event. The immutable event
+          # base still gives a conservative scan range for the exact head.
           if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
             number="$(jq -er '.pull_request.number' "$GITHUB_EVENT_PATH")"
             [[ "$number" =~ ^[1-9][0-9]*$ ]]
             gh api "repos/$GITHUB_REPOSITORY/pulls/$number" > "$RUNNER_TEMP/q1x-live-proposal.json"
-            jq -e --slurpfile event "$GITHUB_EVENT_PATH" --arg repo "$GITHUB_REPOSITORY" --arg default "$default_branch" '
+            jq -e --slurpfile event "$GITHUB_EVENT_PATH" --arg repo "$GITHUB_REPOSITORY" '
               .state == "open" and .head.sha == $event[0].pull_request.head.sha and
-              .base.sha == $event[0].pull_request.base.sha and
-              .base.ref == $event[0].pull_request.base.ref and .base.ref == $default and
+              .base.ref == $event[0].pull_request.base.ref and
               .base.repo.full_name == $repo
             ' "$RUNNER_TEMP/q1x-live-proposal.json" > /dev/null
           elif [[ "$GITHUB_EVENT_NAME" == merge_group ]]; then
-            jq -e --arg base "refs/heads/$default_branch" '.merge_group.base_ref == $base' "$GITHUB_EVENT_PATH" > /dev/null
-            base_ref="$(printf '%s' "$default_branch" | jq -sRr @uri)"
+            base_branch="$(jq -er '.merge_group.base_ref | select(startswith("refs/heads/")) | ltrimstr("refs/heads/") | select(length > 0)' "$GITHUB_EVENT_PATH")"
+            base_ref="$(printf '%s' "$base_branch" | jq -sRr @uri)"
             live_base="$(gh api "repos/$GITHUB_REPOSITORY/branches/$base_ref" --jq '.commit.sha')"
             head_ref="$(jq -er '.merge_group.head_ref | select(startswith("refs/heads/")) | ltrimstr("refs/")' "$GITHUB_EVENT_PATH")"
             live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/$head_ref" --jq '.object.sha')"

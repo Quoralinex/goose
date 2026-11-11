@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   secret-scan:
@@ -21,6 +22,41 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify the live proposal binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/q1x-verify-proposal.sh"
+          cat > "$verifier" <<'VERIFY'
+          set -euo pipefail
+          default_branch="$(jq -er '.repository.default_branch' "$GITHUB_EVENT_PATH")"
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            number="$(jq -er '.pull_request.number' "$GITHUB_EVENT_PATH")"
+            [[ "$number" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$number" > "$RUNNER_TEMP/q1x-live-proposal.json"
+            jq -e --slurpfile event "$GITHUB_EVENT_PATH" --arg repo "$GITHUB_REPOSITORY" --arg default "$default_branch" '
+              .state == "open" and .head.sha == $event[0].pull_request.head.sha and
+              .base.sha == $event[0].pull_request.base.sha and
+              .base.ref == $event[0].pull_request.base.ref and .base.ref == $default and
+              .base.repo.full_name == $repo
+            ' "$RUNNER_TEMP/q1x-live-proposal.json" > /dev/null
+          elif [[ "$GITHUB_EVENT_NAME" == merge_group ]]; then
+            jq -e --arg base "refs/heads/$default_branch" '.merge_group.base_ref == $base' "$GITHUB_EVENT_PATH" > /dev/null
+            base_ref="$(printf '%s' "$default_branch" | jq -sRr @uri)"
+            live_base="$(gh api "repos/$GITHUB_REPOSITORY/branches/$base_ref" --jq '.commit.sha')"
+            head_ref="$(jq -er '.merge_group.head_ref | select(startswith("refs/heads/")) | ltrimstr("refs/")' "$GITHUB_EVENT_PATH")"
+            live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/$head_ref" --jq '.object.sha')"
+            test "$live_base" = "$(jq -er '.merge_group.base_sha' "$GITHUB_EVENT_PATH")"
+            test "$live_head" = "$(jq -er '.merge_group.head_sha' "$GITHUB_EVENT_PATH")"
+          else
+            echo 'Unsupported proposal event.' >&2
+            exit 1
+          fi
+          VERIFY
+          chmod 500 "$verifier"
+          bash "$verifier"
 
       - name: Verify the commit range
         id: range
@@ -99,3 +135,8 @@ jobs:
             --no-banner \
             --no-color \
             --timeout 600
+
+      - name: Recheck the live proposal after scanning
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash "$RUNNER_TEMP/q1x-verify-proposal.sh"

@@ -65,11 +65,31 @@ jobs:
             mv -- "$repo_ignore" "$ignored_repo_file"
             trap 'mv -- "$ignored_repo_file" "$repo_ignore"' EXIT
           fi
-          if ! git log -p -U0 --text -m --no-ext-diff --no-textconv "$COMMIT_RANGE" \
-            | awk '/^\+(version https:\/\/git-lfs\.github\.com\/spec\/v1|oid sha256:[0-9a-f]{64})$/ { found=1 } END { exit found ? 1 : 0 }'; then
-            echo 'Changed Git LFS pointers require separate content scanning; failing closed.' >&2
-            exit 1
-          fi
+          git lfs version > /dev/null
+          git log --raw --no-abbrev --format= -m --no-renames "$COMMIT_RANGE" \
+            | awk '/^:/ && $4 !~ /^0+$/ { print $4 }' \
+            | sort -u \
+            | git cat-file --batch-check > "$RUNNER_TEMP/q1x-changed-objects"
+          while read -r object_id object_type object_size; do
+            if [[ "$object_type" != blob || "$object_size" -eq 0 || "$object_size" -gt 1024 ]]; then
+              continue
+            fi
+            git cat-file blob "$object_id" > "$RUNNER_TEMP/q1x-pointer-candidate"
+            pointer_status=0
+            git lfs pointer --check --stdin < "$RUNNER_TEMP/q1x-pointer-candidate" \
+              > /dev/null 2>&1 || pointer_status=$?
+            case "$pointer_status" in
+              0)
+                echo 'Changed Git LFS pointers require separate content scanning; failing closed.' >&2
+                exit 1
+                ;;
+              1) ;;
+              *)
+                echo 'Git LFS pointer validation failed.' >&2
+                exit 1
+                ;;
+            esac
+          done < "$RUNNER_TEMP/q1x-changed-objects"
           "$RUNNER_TEMP/gitleaks" git . \
             --log-opts "--text -m --no-ext-diff --no-textconv $COMMIT_RANGE" \
             --config "$RUNNER_TEMP/q1x-gitleaks.toml" \

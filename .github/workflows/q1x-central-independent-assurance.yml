@@ -1,0 +1,152 @@
+name: Q1X Central Independent Assurance
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  secret-scan:
+    name: Gitleaks Secret Scan
+    # Required for organization ruleset execution across repositories.
+    if: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact proposed head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the live proposal binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/q1x-verify-proposal.sh"
+          cat > "$verifier" <<'VERIFY'
+          set -euo pipefail
+          # Only descendant target updates preserve the immutable scan range.
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            number="$(jq -er '.pull_request.number' "$GITHUB_EVENT_PATH")"
+            [[ "$number" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$number" > "$RUNNER_TEMP/q1x-live-proposal.json"
+            jq -e --slurpfile event "$GITHUB_EVENT_PATH" --arg repo "$GITHUB_REPOSITORY" '
+              .state == "open" and .head.sha == $event[0].pull_request.head.sha and
+              .base.ref == $event[0].pull_request.base.ref and
+              .base.repo.full_name == $repo
+            ' "$RUNNER_TEMP/q1x-live-proposal.json" > /dev/null
+            event_base="$(jq -er '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
+            live_base="$(jq -er '.base.sha' "$RUNNER_TEMP/q1x-live-proposal.json")"
+            [[ "$event_base" =~ ^[0-9a-f]{40}$ && "$live_base" =~ ^[0-9a-f]{40}$ ]]
+            if [[ "$live_base" != "$event_base" ]]; then
+              gh api "repos/$GITHUB_REPOSITORY/compare/$event_base...$live_base" \
+                > "$RUNNER_TEMP/q1x-base-ancestry.json"
+              jq -e --arg base "$event_base" '
+                (.status == "ahead" or .status == "identical") and
+                .base_commit.sha == $base and .merge_base_commit.sha == $base
+              ' "$RUNNER_TEMP/q1x-base-ancestry.json" > /dev/null
+            fi
+          elif [[ "$GITHUB_EVENT_NAME" == merge_group ]]; then
+            base_branch="$(jq -er '.merge_group.base_ref | select(startswith("refs/heads/")) | ltrimstr("refs/heads/") | select(length > 0)' "$GITHUB_EVENT_PATH")"
+            base_ref="$(printf '%s' "$base_branch" | jq -sRr @uri)"
+            live_base="$(gh api "repos/$GITHUB_REPOSITORY/branches/$base_ref" --jq '.commit.sha')"
+            head_ref="$(jq -er '.merge_group.head_ref | select(startswith("refs/heads/")) | ltrimstr("refs/")' "$GITHUB_EVENT_PATH")"
+            live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/$head_ref" --jq '.object.sha')"
+            test "$live_base" = "$(jq -er '.merge_group.base_sha' "$GITHUB_EVENT_PATH")"
+            test "$live_head" = "$(jq -er '.merge_group.head_sha' "$GITHUB_EVENT_PATH")"
+          else
+            echo 'Unsupported proposal event.' >&2
+            exit 1
+          fi
+          VERIFY
+          chmod 500 "$verifier"
+          bash "$verifier"
+
+      - name: Verify the commit range
+        id: range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          test -n "$merge_base"
+          test "$(git rev-list --count "${merge_base}..${HEAD_SHA}")" -gt 0
+          printf 'range=%s..%s\n' "$merge_base" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Download the pinned secret scanner
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --location --silent --show-error --retry 2 \
+            --output "$archive" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz
+          printf '%s  %s\n' \
+            79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e \
+            "$archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          test "$("$RUNNER_TEMP/gitleaks" version)" = 8.30.0
+
+      - name: Scan proposed commits with fixed rules
+        env:
+          COMMIT_RANGE: ${{ steps.range.outputs.range }}
+        run: |
+          set -euo pipefail
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/q1x-gitleaks.toml"
+          : > "$RUNNER_TEMP/q1x-gitleaks-ignore"
+          repo_ignore="$PWD/.gitleaksignore"
+          if [[ -e "$repo_ignore" || -L "$repo_ignore" ]]; then
+            ignored_repo_file="$(mktemp -d "$RUNNER_TEMP/q1x-gitleaks-ignore.XXXXXX")/.gitleaksignore"
+            mv -- "$repo_ignore" "$ignored_repo_file"
+            trap 'mv -- "$ignored_repo_file" "$repo_ignore"' EXIT
+          fi
+          git lfs version > /dev/null
+          git log --raw --no-abbrev --format= -m --no-renames "$COMMIT_RANGE" \
+            | awk '/^:/ && $4 !~ /^0+$/ { print $4 }' \
+            | sort -u \
+            | git cat-file --batch-check > "$RUNNER_TEMP/q1x-changed-objects"
+          while read -r object_id object_type object_size; do
+            if [[ "$object_type" != blob || "$object_size" -eq 0 || "$object_size" -gt 1024 ]]; then
+              continue
+            fi
+            git cat-file blob "$object_id" > "$RUNNER_TEMP/q1x-pointer-candidate"
+            pointer_status=0
+            git lfs pointer --check --stdin < "$RUNNER_TEMP/q1x-pointer-candidate" \
+              > /dev/null 2>&1 || pointer_status=$?
+            case "$pointer_status" in
+              0)
+                echo 'Changed Git LFS pointers require separate content scanning; failing closed.' >&2
+                exit 1
+                ;;
+              1) ;;
+              *)
+                echo 'Git LFS pointer validation failed.' >&2
+                exit 1
+                ;;
+            esac
+          done < "$RUNNER_TEMP/q1x-changed-objects"
+          "$RUNNER_TEMP/gitleaks" git . \
+            --log-opts "--text -m --no-ext-diff --no-textconv $COMMIT_RANGE" \
+            --config "$RUNNER_TEMP/q1x-gitleaks.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP/q1x-gitleaks-ignore" \
+            --ignore-gitleaks-allow \
+            --redact=100 \
+            --no-banner \
+            --no-color \
+            --timeout 600
+
+      - name: Recheck the live proposal after scanning
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash "$RUNNER_TEMP/q1x-verify-proposal.sh"
